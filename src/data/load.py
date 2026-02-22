@@ -119,9 +119,17 @@ def load_polymarket_trades(
     path = Path(data_dir)
     if not path.exists():
         raise FileNotFoundError(f"Polymarket trades directory not found: {path}")
-    pattern = str(path / "*.parquet")
-    if not list(path.glob("*.parquet")):
-        pattern = str(path / "**" / "*.parquet")
+    files = list(path.glob("*.parquet")) or list(path.glob("**/*.parquet"))
+    files = [f for f in files if not f.name.startswith("._")]
+    if not files:
+        return pd.DataFrame(
+            columns=[
+                "block_number", "transaction_hash", "log_index", "order_hash",
+                "maker", "taker", "maker_asset_id", "taker_asset_id",
+                "maker_amount", "taker_amount", "fee",
+            ]
+        )
+    files_str = ", ".join(f"'{f}'" for f in sorted(files))
 
     con = duckdb.connect()
     query = f"""
@@ -137,7 +145,7 @@ def load_polymarket_trades(
         maker_amount,
         taker_amount,
         fee
-    FROM read_parquet('{pattern}', hive_partitioning=0)
+    FROM read_parquet([{files_str}], hive_partitioning=0)
     """
     df = con.execute(query).df()
     con.close()
