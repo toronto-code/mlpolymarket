@@ -129,6 +129,8 @@ def load_polymarket_trades(
                 "maker_amount", "taker_amount", "fee",
             ]
         )
+    n_files = len(files)
+    print(f"  Reading {n_files} parquet files...", flush=True)
     files_str = ", ".join(f"'{f}'" for f in sorted(files))
 
     con = duckdb.connect()
@@ -149,6 +151,7 @@ def load_polymarket_trades(
     """
     df = con.execute(query).df()
     con.close()
+    print(f"  Loaded {len(df):,} rows.", flush=True)
 
     if df.empty:
         return pd.DataFrame(columns=["ticker", "yes_price", "size", "taker_side", "created_time"])
@@ -185,7 +188,9 @@ def load_polymarket_trades(
 
     # Timestamp: join blocks if provided
     if blocks_dir is not None:
+        print("  Loading block timestamps...", flush=True)
         blocks = load_polymarket_blocks(blocks_dir)
+        print("  Joining trades with blocks...", flush=True)
         df = df.merge(blocks, on="block_number", how="left")
         df = df.rename(columns={"timestamp": "created_time"})
         df["created_time"] = pd.to_datetime(df["created_time"], utc=True)
