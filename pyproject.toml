@@ -1,5 +1,5 @@
 [project]
-name = "polybot-nextprice"
+name = "mlpolymarket"
 version = "0.1.0"
 description = "Next-price / short-horizon prediction for prediction markets (Kalshi/Polymarket)"
 readme = "README.md"

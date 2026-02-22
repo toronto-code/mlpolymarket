@@ -15,7 +15,7 @@ Short-horizon price prediction on **Polymarket** trade data: next trade price fr
 ## Setup
 
 ```bash
-cd /path/to/polybot_feb2026
+cd /path/to/mlpolymarket
 uv sync
 ```
 
