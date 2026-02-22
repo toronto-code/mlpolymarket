@@ -1,6 +1,6 @@
-# Data and outputs (large or machine-specific)
-data/
-output/
+# Data and outputs (large or machine-specific); / = root only so src/data is tracked
+/data/
+/output/
 *.pt
 
 # Python
