@@ -1,0 +1,55 @@
+# Next-price prediction: Polymarket, past year, train/val/test.
+
+seed: 42
+
+data:
+  polymarket_trades: "data/polymarket/trades"
+  polymarket_blocks: "data/polymarket/blocks"
+  last_n_months: 12
+
+platform: "polymarket"
+
+sequence:
+  length: 32
+  min_trades_per_market: 100
+
+target:
+  type: "next_price"
+  horizon: 1
+
+# Train / val / test by time. Val used for early stopping and model selection; test used once for reporting.
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+# Normalize features (per-feature mean/std on train). Recommended for neural nets.
+normalize_features: true
+
+models:
+  baseline_last_price: true
+  baseline_vwap: true
+  mlp: true
+  lstm: true
+
+training:
+  batch_size: 256
+  epochs: 50
+  lr: 1.0e-3
+  early_stopping_patience: 7
+  device: "cpu"
+  seed: 42
+
+mlp:
+  hidden: [128, 64, 32]
+  dropout: 0.2
+
+lstm:
+  hidden: 128
+  num_layers: 2
+  dropout: 0.2
+
+output:
+  dir: "output"
+  save_models: true
+  save_metrics: true

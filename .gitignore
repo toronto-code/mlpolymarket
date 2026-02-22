@@ -1,0 +1,29 @@
+# Data and outputs (large or machine-specific)
+data/
+output/
+*.pt
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Cloned data repo (optional; remove if you want to track it)
+_data_repo/
+
+# Env and secrets
+.env
+.env.local
+*.pem
