@@ -23,8 +23,10 @@ uv sync
 
 ## Data
 
-- **Real data**: In the [prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis) repo run `make setup`, then point this repo at it with `--data-dir`.
-- **Dummy data**: `python scripts/generate_dummy_polymarket.py` to create `data/polymarket/trades/` and `data/polymarket/blocks/` under the project root.
+- **Real data (recommended)**: In the [prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis) repo run `make setup`, then point this repo at it with `--data-dir`.
+  - This gives you full **Polymarket** and **Kalshi** datasets on disk.
+  - This project is configured by default to use **Polymarket only** and the **last 12 months** of trades (`data.last_n_months: 12` in `config/default.yaml`).
+  - To exclude sports-betting markets, filter them out when preparing the Polymarket dataset in `prediction-market-analysis` (e.g., dropping markets whose titles/categories indicate sports) so that `data/polymarket/trades/` only contains non-sports markets.
 
 ## Single run
 
@@ -78,8 +80,7 @@ src/
   data/          # load_polymarket_trades (with last_n_months), build_sequences, SequenceScaler, time_based_split_three_way
   models/        # LastPriceBaseline, VWAPBaseline, MLPModel, LSTMModel (fit with explicit val, get/load_state_dict)
   eval/          # compute_metrics, print_metrics
-scripts/
-  generate_dummy_polymarket.py
+
 ```
 
 ## Notes
