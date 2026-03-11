@@ -91,6 +91,44 @@ Rough time: ~30 min–2 hours depending on data size.
 
 ---
 
+## 6b. Run training so it survives disconnects (recommended)
+
+If you run training in the browser SSH window and close your laptop/tab, the SSH session can drop and terminate the Python process. Use one of these approaches.
+
+### Option A: `screen` (interactive)
+
+```bash
+sudo apt-get install -y screen
+cd ~/mlpolymarket
+screen -S train
+source .venv/bin/activate
+python sweep.py --config config/sweep.yaml --data-dir ~/prediction-market-analysis
+```
+
+Detach (keeps running): press `Ctrl+A` then `D`.
+
+Re-attach later:
+
+```bash
+screen -r train
+```
+
+### Option B: background + logs (non-interactive)
+
+```bash
+cd ~/mlpolymarket
+chmod +x scripts/run_background.sh
+DATA_DIR=~/prediction-market-analysis ./scripts/run_background.sh sweep
+```
+
+Then watch logs:
+
+```bash
+tail -f output/logs/sweep_*.log
+```
+
+---
+
 ## 7. Copy results to your Mac (from Mac terminal)
 
 ```bash
