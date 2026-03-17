@@ -97,13 +97,13 @@ def load_polymarket_markets(data_dir: str | Path) -> pd.DataFrame:
     path = Path(data_dir)
     if not path.exists():
         raise FileNotFoundError(f"Polymarket markets directory not found: {path}")
-    pattern = str(path / "*.parquet")
-    if not list(path.glob("*.parquet")):
-        pattern = str(path / "**" / "*.parquet")
+    files = list(path.glob("*.parquet")) or list(path.glob("**/*.parquet"))
+    files = [f for f in files if not f.name.startswith("._")]
+    if not files:
+        return pd.DataFrame()
+    files_str = ", ".join(f"'{f}'" for f in sorted(files))
     con = duckdb.connect()
-    df = con.execute(
-        f"SELECT * FROM read_parquet('{pattern}', hive_partitioning=0)"
-    ).df()
+    df = con.execute(f"SELECT * FROM read_parquet([{files_str}], hive_partitioning=0)").df()
     con.close()
     return df
 
