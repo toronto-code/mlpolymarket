@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import yaml
 
-from src.data.load import load_polymarket_trades
+from src.data.load import load_polymarket_trades, load_sports_ticker_ids_file
 from src.data.scaler import SequenceScaler
 from src.data.sequences import build_sequences, time_based_split_three_way
 from src.eval.metrics import compute_metrics, print_metrics
@@ -75,15 +75,33 @@ def main() -> None:
     trades_path = data_root / data_cfg.get("polymarket_trades", "data/polymarket/trades")
     blocks_path = data_root / data_cfg.get("polymarket_blocks", "data/polymarket/blocks")
     last_n_months = data_cfg.get("last_n_months", 12)
+    exclude_sports = data_cfg.get("exclude_sports", False)
+    sports_tickers_file = data_cfg.get("polymarket_sports_tickers_file")
+
+    exclude_tickers: set[str] = set()
+    if exclude_sports and sports_tickers_file:
+        sports_path = data_root / sports_tickers_file
+        exclude_tickers = load_sports_ticker_ids_file(sports_path)
+        if exclude_tickers:
+            print("Excluding {} sports/blocked tickers (from {}).".format(len(exclude_tickers), sports_path))
+        else:
+            print("exclude_sports is true but no tickers in {} (run scripts/generate_sports_tickers.py?).".format(sports_path))
 
     print("Loading Polymarket trades (last {} months)...".format(last_n_months))
     try:
         if blocks_path.exists():
             trades = load_polymarket_trades(
-                trades_path, blocks_dir=blocks_path, last_n_months=last_n_months
+                trades_path,
+                blocks_dir=blocks_path,
+                last_n_months=last_n_months,
+                exclude_tickers=exclude_tickers if exclude_tickers else None,
             )
         else:
-            trades = load_polymarket_trades(trades_path, last_n_months=last_n_months)
+            trades = load_polymarket_trades(
+                trades_path,
+                last_n_months=last_n_months,
+                exclude_tickers=exclude_tickers if exclude_tickers else None,
+            )
     except FileNotFoundError as e:
         print(e)
         print("Point --data-dir to the repo that contains data/polymarket/trades and blocks.")

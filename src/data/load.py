@@ -1,11 +1,20 @@
 """Load Kalshi and Polymarket trade data from Parquet."""
 
+import re
 from pathlib import Path
 from typing import Optional
 
 import duckdb
 import numpy as np
 import pandas as pd
+
+# Keywords (lowercased) in question/slug that mark a market as sports.
+SPORTS_KEYWORDS = re.compile(
+    r"\b(sport|nfl|nba|mlb|nhl|super\s*bowl|world\s*cup|soccer|football|basketball|"
+    r"baseball|hockey|ufc|boxing|tennis|golf|olympics|f1|nascar|premier\s*league|"
+    r"champions\s*league|world\s*series|stanley\s*cup|playoff|mvp|championship)\b",
+    re.I,
+)
 
 
 def load_kalshi_trades(
@@ -83,6 +92,52 @@ def load_kalshi_markets(
     return df
 
 
+def load_polymarket_markets(data_dir: str | Path) -> pd.DataFrame:
+    """Load Polymarket market metadata (question, slug, condition_id, etc.)."""
+    path = Path(data_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"Polymarket markets directory not found: {path}")
+    pattern = str(path / "*.parquet")
+    if not list(path.glob("*.parquet")):
+        pattern = str(path / "**" / "*.parquet")
+    con = duckdb.connect()
+    df = con.execute(
+        f"SELECT * FROM read_parquet('{pattern}', hive_partitioning=0)"
+    ).df()
+    con.close()
+    return df
+
+
+def get_sports_condition_ids_from_markets(markets_df: pd.DataFrame) -> set[str]:
+    """Return set of condition_id (or id) for markets that look like sports from question/slug."""
+    if markets_df.empty:
+        return set()
+    out = set()
+    id_col = "condition_id" if "condition_id" in markets_df.columns else "id"
+    if id_col not in markets_df.columns:
+        return out
+    for _, row in markets_df.iterrows():
+        q = str(row.get("question", "") or "")
+        s = str(row.get("slug", "") or "")
+        if SPORTS_KEYWORDS.search(q) or SPORTS_KEYWORDS.search(s):
+            out.add(str(row[id_col]))
+    return out
+
+
+def load_sports_ticker_ids_file(filepath: str | Path) -> set[str]:
+    """Load a set of ticker (asset) IDs to exclude, one per line. Skip blanks and # comments."""
+    path = Path(filepath)
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    with open(path) as f:
+        for line in f:
+            line = line.split("#")[0].strip()
+            if line:
+                out.add(line)
+    return out
+
+
 def load_polymarket_blocks(data_dir: str | Path) -> pd.DataFrame:
     """Load Polymarket block_number -> timestamp mapping."""
     path = Path(data_dir)
@@ -109,6 +164,7 @@ def load_polymarket_trades(
     start_date: Optional[pd.Timestamp] = None,
     end_date: Optional[pd.Timestamp] = None,
     last_n_months: Optional[int] = None,
+    exclude_tickers: Optional[set[str]] = None,
 ) -> pd.DataFrame:
     """
     Load Polymarket CTF Exchange trades from Parquet.
@@ -209,5 +265,11 @@ def load_polymarket_trades(
         if end_date is not None:
             df = df.loc[df["created_time"] <= end_date].copy()
         df = df.reset_index(drop=True)
+
+    if exclude_tickers:
+        before = len(df)
+        df = df.loc[~df["ticker"].isin(exclude_tickers)].copy()
+        df = df.reset_index(drop=True)
+        print(f"  Excluded {before - len(df):,} trades from {len(exclude_tickers):,} sports/blocked tickers.", flush=True)
 
     return df[["ticker", "yes_price", "size", "taker_side", "created_time"]]

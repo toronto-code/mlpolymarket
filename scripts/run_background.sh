@@ -36,12 +36,15 @@ pid_file="${log_dir}/${MODE}_${timestamp}.pid"
 echo "Starting: ${cmd[*]}"
 echo "Log: $log_file"
 
-nohup "${cmd[@]}" >"$log_file" 2>&1 </dev/null &
+# Run in a new session (setsid) so SSH disconnect / SIGHUP never reaches this process.
+# nohup + redirect stdin so it's fully detached from the terminal.
+setsid nohup "${cmd[@]}" >"$log_file" 2>&1 </dev/null &
 pid="$!"
 echo "$pid" > "$pid_file"
+disown -h 2>/dev/null || true
 
-echo "PID: $pid"
+echo "PID: $pid (session leader; Python may be a child)"
 echo "To watch logs:"
 echo "  tail -f \"$log_file\""
 echo "To check if still running:"
-echo "  ps -p $pid"
+echo "  pgrep -af sweep.py   # or  pgrep -af run.py"

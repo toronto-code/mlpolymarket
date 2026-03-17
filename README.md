@@ -26,7 +26,12 @@ uv sync
 - **Real data (recommended)**: In the [prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis) repo run `make setup`, then point this repo at it with `--data-dir`.
   - This gives you full **Polymarket** and **Kalshi** datasets on disk.
   - This project is configured by default to use **Polymarket only** and the **last 12 months** of trades (`data.last_n_months: 12` in `config/default.yaml`).
-  - To exclude sports-betting markets, filter them out when preparing the Polymarket dataset in `prediction-market-analysis` (e.g., dropping markets whose titles/categories indicate sports) so that `data/polymarket/trades/` only contains non-sports markets.
+  - **Exclude sports**: set `data.exclude_sports: true` in `config/default.yaml` and create `data/polymarket/sports_tickers.txt` (one outcome-token ID per line). Generate it once with:
+    ```bash
+    pip install requests  # optional, for the script
+    python scripts/generate_sports_tickers.py --data-dir /path/to/prediction-market-analysis
+    ```
+    The script uses your markets Parquet (question/slug) to detect sports and the Polymarket Gamma API to resolve token IDs.
 
 ## Single run
 

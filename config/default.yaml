@@ -5,7 +5,10 @@ seed: 42
 data:
   polymarket_trades: "data/polymarket/trades"
   polymarket_blocks: "data/polymarket/blocks"
+  polymarket_markets: "data/polymarket/markets"
   last_n_months: 12
+  exclude_sports: true
+  polymarket_sports_tickers_file: "data/polymarket/sports_tickers.txt"
 
 platform: "polymarket"
 
