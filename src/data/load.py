@@ -188,7 +188,94 @@ def load_polymarket_trades(
     n_files = len(files)
     print(f"  Reading {n_files} parquet files...", flush=True)
     files_str = ", ".join(f"'{f}'" for f in sorted(files))
+    # Fast path: when blocks are available, push timestamp join + time filtering down into DuckDB.
+    # This avoids materializing the full (potentially huge) trade dataset into pandas first.
+    if blocks_dir is not None and Path(blocks_dir).exists():
+        bpath = Path(blocks_dir)
+        bfiles = list(bpath.glob("*.parquet")) or list(bpath.glob("**/*.parquet"))
+        bfiles = [f for f in bfiles if not f.name.startswith("._")]
+        if bfiles:
+            bfiles_str = ", ".join(f"'{f}'" for f in sorted(bfiles))
 
+            # Format optional date filters as UTC timestamps that DuckDB can parse.
+            start_utc = (
+                pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%d %H:%M:%S") if start_date is not None else None
+            )
+            end_utc = (
+                pd.to_datetime(end_date, utc=True).strftime("%Y-%m-%d %H:%M:%S") if end_date is not None else None
+            )
+
+            ticker_excl_sql = ""
+            if exclude_tickers:
+                tickers_list = ", ".join(f"'{t}'" for t in sorted(exclude_tickers))
+                ticker_excl_sql = f" AND ticker NOT IN ({tickers_list})"
+
+            time_filter_sql = ""
+            if last_n_months is not None:
+                time_filter_sql += (
+                    " AND created_time >= ("
+                    f"SELECT max(timestamp) - INTERVAL '{int(last_n_months)} months' "
+                    f"FROM read_parquet([{bfiles_str}], hive_partitioning=0) b2"
+                    ")"
+                )
+            if start_utc is not None:
+                time_filter_sql += f" AND created_time >= TIMESTAMP '{start_utc}'"
+            if end_utc is not None:
+                time_filter_sql += f" AND created_time <= TIMESTAMP '{end_utc}'"
+
+            con = duckdb.connect()
+            query = f"""
+            WITH raw AS (
+                SELECT
+                    b.timestamp AS created_time,
+                    CASE
+                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN CAST(t.taker_asset_id AS VARCHAR)
+                        ELSE CAST(t.maker_asset_id AS VARCHAR)
+                    END AS ticker,
+                    CASE
+                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN 'yes'
+                        ELSE 'no'
+                    END AS taker_side,
+                    CASE
+                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN
+                            CASE WHEN CAST(t.taker_amount AS BIGINT) > 0
+                                THEN CAST(t.maker_amount AS DOUBLE) / CAST(t.taker_amount AS DOUBLE)
+                                ELSE NULL
+                            END
+                        ELSE
+                            CASE WHEN CAST(t.maker_amount AS BIGINT) > 0
+                                THEN CAST(t.taker_amount AS DOUBLE) / CAST(t.maker_amount AS DOUBLE)
+                                ELSE NULL
+                            END
+                    END AS yes_price,
+                    CASE
+                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0
+                            THEN CAST(t.taker_amount AS DOUBLE) / 1e6
+                        ELSE
+                            CAST(t.maker_amount AS DOUBLE) / 1e6
+                    END AS size
+                FROM read_parquet([{files_str}], hive_partitioning=0) t
+                JOIN read_parquet([{bfiles_str}], hive_partitioning=0) b
+                ON t.block_number = b.block_number
+            )
+            SELECT ticker, yes_price, size, taker_side, created_time
+            FROM raw
+            WHERE yes_price BETWEEN {min_price} AND {max_price}
+            {time_filter_sql}
+            {ticker_excl_sql}
+            ORDER BY ticker, created_time
+            """
+            df = con.execute(query).df()
+            con.close()
+
+            if df.empty:
+                return pd.DataFrame(columns=["ticker", "yes_price", "size", "taker_side", "created_time"])
+
+            df["created_time"] = pd.to_datetime(df["created_time"], utc=True)
+            print(f"  Loaded {len(df):,} rows.", flush=True)
+            return df[["ticker", "yes_price", "size", "taker_side", "created_time"]]
+
+    # Fallback (no blocks available): original behavior (compute timestamps in pandas).
     con = duckdb.connect()
     query = f"""
     SELECT
@@ -221,39 +308,21 @@ def load_polymarket_trades(
 
     # is_buy: maker gives USDC (maker_asset_id == 0)
     is_buy = df["maker_asset_id"] == 0
-    # Price in [0,1]: USDC per outcome token. When is_buy: maker gives USDC, taker gives tokens -> price = maker_amount/taker_amount
+    # Price in [0,1]
     df["yes_price"] = np.where(
         is_buy,
         np.where(df["taker_amount"] > 0, df["maker_amount"] / df["taker_amount"], np.nan),
         np.where(df["maker_amount"] > 0, df["taker_amount"] / df["maker_amount"], np.nan),
     )
-    # Size: outcome tokens traded (6 decimals in amounts)
-    df["size"] = np.where(
-        is_buy,
-        df["taker_amount"] / 1e6,
-        df["maker_amount"] / 1e6,
-    ).astype(np.float64)
-    # Market = outcome token asset id (same for all trades in one outcome)
+    # Size in tokens (amounts are 1e6-scaled)
+    df["size"] = np.where(is_buy, df["taker_amount"] / 1e6, df["maker_amount"] / 1e6).astype(np.float64)
     df["ticker"] = np.where(is_buy, df["taker_asset_id"].astype(str), df["maker_asset_id"].astype(str))
     df["taker_side"] = np.where(is_buy, "yes", "no")
 
-    # Filter valid prices
-    df = df.loc[
-        (df["yes_price"] >= min_price) & (df["yes_price"] <= max_price)
-    ].copy()
+    df = df.loc[(df["yes_price"] >= min_price) & (df["yes_price"] <= max_price)].copy()
 
-    # Timestamp: join blocks if provided
-    if blocks_dir is not None:
-        print("  Loading block timestamps...", flush=True)
-        blocks = load_polymarket_blocks(blocks_dir)
-        print("  Joining trades with blocks...", flush=True)
-        df = df.merge(blocks, on="block_number", how="left")
-        df = df.rename(columns={"timestamp": "created_time"})
-        df["created_time"] = pd.to_datetime(df["created_time"], utc=True)
-    else:
-        # No blocks: use block_number as proxy for ordering (monotonic)
-        df["created_time"] = pd.to_datetime(df["block_number"], unit="s", origin="unix", utc=True)
-
+    # No blocks: use block_number as proxy for ordering (monotonic)
+    df["created_time"] = pd.to_datetime(df["block_number"], unit="s", origin="unix", utc=True)
     df = df.sort_values(["ticker", "created_time"]).reset_index(drop=True)
 
     if start_date is not None or end_date is not None or last_n_months is not None:
@@ -267,9 +336,7 @@ def load_polymarket_trades(
         df = df.reset_index(drop=True)
 
     if exclude_tickers:
-        before = len(df)
         df = df.loc[~df["ticker"].isin(exclude_tickers)].copy()
         df = df.reset_index(drop=True)
-        print(f"  Excluded {before - len(df):,} trades from {len(exclude_tickers):,} sports/blocked tickers.", flush=True)
 
     return df[["ticker", "yes_price", "size", "taker_side", "created_time"]]

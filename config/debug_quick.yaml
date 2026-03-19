@@ -1,0 +1,58 @@
+seed: 42
+
+data:
+  polymarket_trades: "data/polymarket/trades"
+  polymarket_blocks: "data/polymarket/blocks"
+  polymarket_markets: "data/polymarket/markets"
+  # Quick smoke test: only train on ~1 month of trades.
+  last_n_months: 1
+  exclude_sports: true
+  polymarket_sports_tickers_file: "data/polymarket/sports_tickers.txt"
+
+platform: "polymarket"
+
+sequence:
+  length: 16
+  # Lower to ensure we still build sequences in a short time window.
+  min_trades_per_market: 20
+
+target:
+  type: "next_price"
+  horizon: 1
+
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+normalize_features: true
+
+models:
+  baseline_last_price: true
+  baseline_vwap: true
+  mlp: true
+  lstm: true
+
+training:
+  # Keep the smoke test fast; early stopping will usually stop earlier.
+  batch_size: 128
+  epochs: 3
+  lr: 1.0e-3
+  early_stopping_patience: 2
+  device: "cpu"
+  seed: 42
+
+mlp:
+  hidden: [128, 64, 32]
+  dropout: 0.2
+
+lstm:
+  hidden: 64
+  num_layers: 2
+  dropout: 0.2
+
+output:
+  dir: "output"
+  save_models: true
+  save_metrics: true
+
