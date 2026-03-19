@@ -236,30 +236,31 @@ def load_polymarket_trades(
                 SELECT
                     TRY_CAST(b.timestamp AS TIMESTAMP) AS created_time,
                     CASE
-                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN CAST(t.taker_asset_id AS VARCHAR)
+                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
+                            THEN CAST(t.taker_asset_id AS VARCHAR)
                         ELSE CAST(t.maker_asset_id AS VARCHAR)
                     END AS ticker,
                     CASE
-                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN 'yes'
+                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0 THEN 'yes'
                         ELSE 'no'
                     END AS taker_side,
                     CASE
-                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN
-                            CASE WHEN CAST(t.taker_amount AS BIGINT) > 0
-                                THEN CAST(t.maker_amount AS DOUBLE) / CAST(t.taker_amount AS DOUBLE)
+                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0 THEN
+                            CASE WHEN TRY_CAST(t.taker_amount AS DOUBLE) > 0
+                                THEN TRY_CAST(t.maker_amount AS DOUBLE) / TRY_CAST(t.taker_amount AS DOUBLE)
                                 ELSE NULL
                             END
                         ELSE
-                            CASE WHEN CAST(t.maker_amount AS BIGINT) > 0
-                                THEN CAST(t.taker_amount AS DOUBLE) / CAST(t.maker_amount AS DOUBLE)
+                            CASE WHEN TRY_CAST(t.maker_amount AS DOUBLE) > 0
+                                THEN TRY_CAST(t.taker_amount AS DOUBLE) / TRY_CAST(t.maker_amount AS DOUBLE)
                                 ELSE NULL
                             END
                     END AS yes_price,
                     CASE
-                        WHEN CAST(t.maker_asset_id AS BIGINT) = 0
-                            THEN CAST(t.taker_amount AS DOUBLE) / 1e6
+                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
+                            THEN TRY_CAST(t.taker_amount AS DOUBLE) / 1e6
                         ELSE
-                            CAST(t.maker_amount AS DOUBLE) / 1e6
+                            TRY_CAST(t.maker_amount AS DOUBLE) / 1e6
                     END AS size
                 FROM read_parquet([{files_str}], hive_partitioning=0) t
                 JOIN read_parquet([{bfiles_str}], hive_partitioning=0) b
