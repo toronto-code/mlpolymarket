@@ -234,7 +234,7 @@ def load_polymarket_trades(
             query = f"""
             WITH raw AS (
                 SELECT
-                    b.timestamp AS created_time,
+                    TRY_CAST(b.timestamp AS TIMESTAMP) AS created_time,
                     CASE
                         WHEN CAST(t.maker_asset_id AS BIGINT) = 0 THEN CAST(t.taker_asset_id AS VARCHAR)
                         ELSE CAST(t.maker_asset_id AS VARCHAR)
