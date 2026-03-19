@@ -212,12 +212,19 @@ def load_polymarket_trades(
 
             time_filter_sql = ""
             if last_n_months is not None:
-                time_filter_sql += (
-                    " AND created_time >= ("
-                    f"SELECT max(timestamp) - INTERVAL '{int(last_n_months)} months' "
-                    f"FROM read_parquet([{bfiles_str}], hive_partitioning=0) b2"
-                    ")"
-                )
+                # DuckDB interval syntax can be brittle across versions.
+                # Compute the cutoff timestamp in Python by fetching only the
+                # max blocks timestamp (cheap) and subtracting months.
+                con_max = duckdb.connect()
+                max_ts = con_max.execute(
+                    f"SELECT max(timestamp) FROM read_parquet([{bfiles_str}], hive_partitioning=0)"
+                ).fetchone()[0]
+                con_max.close()
+                if max_ts is None:
+                    return pd.DataFrame(columns=["ticker", "yes_price", "size", "taker_side", "created_time"])
+                cutoff_dt = pd.to_datetime(max_ts, utc=True) - pd.DateOffset(months=int(last_n_months))
+                cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+                time_filter_sql += f" AND created_time >= TIMESTAMP '{cutoff_str}'"
             if start_utc is not None:
                 time_filter_sql += f" AND created_time >= TIMESTAMP '{start_utc}'"
             if end_utc is not None:
