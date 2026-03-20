@@ -216,6 +216,10 @@ def load_polymarket_trades(
                 # Compute the cutoff timestamp in Python by fetching only the
                 # max blocks timestamp (cheap) and subtracting months.
                 con_max = duckdb.connect()
+                # DuckDB uses a local temp directory (default: ".tmp") for intermediates.
+                # Ensure it points to a writable path so training doesn't fail if the
+                # repo directory isn't writable by the current user.
+                con_max.execute("PRAGMA temp_directory='/tmp'")
                 max_ts = con_max.execute(
                     f"SELECT max(timestamp) FROM read_parquet([{bfiles_str}], hive_partitioning=0)"
                 ).fetchone()[0]
@@ -231,6 +235,7 @@ def load_polymarket_trades(
                 time_filter_sql += f" AND created_time <= TIMESTAMP '{end_utc}'"
 
             con = duckdb.connect()
+            con.execute("PRAGMA temp_directory='/tmp'")
             query = f"""
             WITH raw AS (
                 SELECT
@@ -285,6 +290,7 @@ def load_polymarket_trades(
 
     # Fallback (no blocks available): original behavior (compute timestamps in pandas).
     con = duckdb.connect()
+    con.execute("PRAGMA temp_directory='/tmp'")
     query = f"""
     SELECT
         block_number,
