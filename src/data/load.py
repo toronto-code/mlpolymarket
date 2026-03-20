@@ -248,45 +248,58 @@ def load_polymarket_trades(
                 WHERE 1=1
                 {blocks_where_sql}
             ),
-            raw AS (
+            trades_filtered AS (
                 SELECT
-                    b.created_time AS created_time,
-                    CASE
-                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
-                            THEN CAST(t.taker_asset_id AS VARCHAR)
-                        ELSE CAST(t.maker_asset_id AS VARCHAR)
-                    END AS ticker,
-                    CASE
-                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0 THEN 'yes'
-                        ELSE 'no'
-                    END AS taker_side,
-                    CASE
-                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0 THEN
-                            CASE WHEN TRY_CAST(t.taker_amount AS DOUBLE) > 0
-                                THEN TRY_CAST(t.maker_amount AS DOUBLE) / TRY_CAST(t.taker_amount AS DOUBLE)
-                                ELSE NULL
-                            END
-                        ELSE
-                            CASE WHEN TRY_CAST(t.maker_amount AS DOUBLE) > 0
-                                THEN TRY_CAST(t.taker_amount AS DOUBLE) / TRY_CAST(t.maker_amount AS DOUBLE)
-                                ELSE NULL
-                            END
-                    END AS yes_price,
-                    CASE
-                        WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
-                            THEN TRY_CAST(t.taker_amount AS DOUBLE) / 1e6
-                        ELSE
-                            TRY_CAST(t.maker_amount AS DOUBLE) / 1e6
-                    END AS size
-                FROM read_parquet([{files_str}], hive_partitioning=0) t
-                JOIN blocks_filtered b
-                ON t.block_number = b.block_number
+                    tf.block_number,
+                    tf.ticker,
+                    tf.yes_price,
+                    tf.size,
+                    tf.taker_side
+                FROM (
+                    SELECT
+                        t.block_number,
+                        CASE
+                            WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
+                                THEN CAST(t.taker_asset_id AS VARCHAR)
+                            ELSE CAST(t.maker_asset_id AS VARCHAR)
+                        END AS ticker,
+                        CASE
+                            WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0 THEN 'yes'
+                            ELSE 'no'
+                        END AS taker_side,
+                        CASE
+                            WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0 THEN
+                                CASE WHEN TRY_CAST(t.taker_amount AS DOUBLE) > 0
+                                    THEN TRY_CAST(t.maker_amount AS DOUBLE) / TRY_CAST(t.taker_amount AS DOUBLE)
+                                    ELSE NULL
+                                END
+                            ELSE
+                                CASE WHEN TRY_CAST(t.maker_amount AS DOUBLE) > 0
+                                    THEN TRY_CAST(t.taker_amount AS DOUBLE) / TRY_CAST(t.maker_amount AS DOUBLE)
+                                    ELSE NULL
+                                END
+                        END AS yes_price,
+                        CASE
+                            WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
+                                THEN TRY_CAST(t.taker_amount AS DOUBLE) / 1e6
+                            ELSE
+                                TRY_CAST(t.maker_amount AS DOUBLE) / 1e6
+                        END AS size
+                    FROM read_parquet([{files_str}], hive_partitioning=0) t
+                ) tf
+                WHERE tf.yes_price BETWEEN {min_price} AND {max_price}
+                {ticker_excl_sql}
+                {limit_sql}
             )
-            SELECT ticker, yes_price, size, taker_side, created_time
-            FROM raw
-            WHERE yes_price BETWEEN {min_price} AND {max_price}
-            {ticker_excl_sql}
-            {limit_sql}
+            SELECT
+                tf.ticker,
+                tf.yes_price,
+                tf.size,
+                tf.taker_side,
+                b.created_time AS created_time
+            FROM trades_filtered tf
+            JOIN blocks_filtered b
+            ON tf.block_number = b.block_number
             """
             df = con.execute(query).df()
             con.close()
