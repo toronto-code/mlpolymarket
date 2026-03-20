@@ -165,6 +165,7 @@ def load_polymarket_trades(
     end_date: Optional[pd.Timestamp] = None,
     last_n_months: Optional[int] = None,
     exclude_tickers: Optional[set[str]] = None,
+    max_rows: Optional[int] = None,
 ) -> pd.DataFrame:
     """
     Load Polymarket CTF Exchange trades from Parquet.
@@ -185,6 +186,7 @@ def load_polymarket_trades(
                 "maker_amount", "taker_amount", "fee",
             ]
         )
+    limit_sql = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
     n_files = len(files)
     print(f"  Reading {n_files} parquet files...", flush=True)
     files_str = ", ".join(f"'{f}'" for f in sorted(files))
@@ -277,14 +279,14 @@ def load_polymarket_trades(
                             TRY_CAST(t.maker_amount AS DOUBLE) / 1e6
                     END AS size
                 FROM read_parquet([{files_str}], hive_partitioning=0) t
-                JOIN read_parquet([{bfiles_str}], hive_partitioning=0) b
+                JOIN blocks_filtered b
                 ON t.block_number = b.block_number
             )
             SELECT ticker, yes_price, size, taker_side, created_time
             FROM raw
             WHERE yes_price BETWEEN {min_price} AND {max_price}
             {ticker_excl_sql}
-            ORDER BY ticker, created_time
+            {limit_sql}
             """
             df = con.execute(query).df()
             con.close()
@@ -313,6 +315,7 @@ def load_polymarket_trades(
         taker_amount,
         fee
     FROM read_parquet([{files_str}], hive_partitioning=0)
+    {limit_sql}
     """
     df = con.execute(query).df()
     con.close()

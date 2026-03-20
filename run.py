@@ -77,6 +77,7 @@ def main() -> None:
     last_n_months = data_cfg.get("last_n_months", 12)
     exclude_sports = data_cfg.get("exclude_sports", False)
     sports_tickers_file = data_cfg.get("polymarket_sports_tickers_file")
+    max_rows = data_cfg.get("max_rows")
 
     exclude_tickers: set[str] = set()
     if exclude_sports and sports_tickers_file:
@@ -95,12 +96,14 @@ def main() -> None:
                 blocks_dir=blocks_path,
                 last_n_months=last_n_months,
                 exclude_tickers=exclude_tickers if exclude_tickers else None,
+                max_rows=max_rows,
             )
         else:
             trades = load_polymarket_trades(
                 trades_path,
                 last_n_months=last_n_months,
                 exclude_tickers=exclude_tickers if exclude_tickers else None,
+                max_rows=max_rows,
             )
     except FileNotFoundError as e:
         print(e)

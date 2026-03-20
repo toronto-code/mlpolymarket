@@ -6,6 +6,9 @@ data:
   polymarket_markets: "data/polymarket/markets"
   # Quick smoke test: only train on ~1 month of trades.
   last_n_months: 1
+  # Hard cap to prevent out-of-memory during DuckDB scan.
+  # Remove for full training runs.
+  max_rows: 200000
   exclude_sports: true
   polymarket_sports_tickers_file: "data/polymarket/sports_tickers.txt"
 
