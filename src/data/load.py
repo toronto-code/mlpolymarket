@@ -210,7 +210,7 @@ def load_polymarket_trades(
                 tickers_list = ", ".join(f"'{t}'" for t in sorted(exclude_tickers))
                 ticker_excl_sql = f" AND ticker NOT IN ({tickers_list})"
 
-            time_filter_sql = ""
+            blocks_where_sql = ""
             if last_n_months is not None:
                 # DuckDB interval syntax can be brittle across versions.
                 # Compute the cutoff timestamp in Python by fetching only the
@@ -228,18 +228,27 @@ def load_polymarket_trades(
                     return pd.DataFrame(columns=["ticker", "yes_price", "size", "taker_side", "created_time"])
                 cutoff_dt = pd.to_datetime(max_ts, utc=True) - pd.DateOffset(months=int(last_n_months))
                 cutoff_str = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
-                time_filter_sql += f" AND created_time >= TIMESTAMP '{cutoff_str}'"
+                blocks_where_sql += f" AND TRY_CAST(timestamp AS TIMESTAMP) >= TIMESTAMP '{cutoff_str}'"
             if start_utc is not None:
-                time_filter_sql += f" AND created_time >= TIMESTAMP '{start_utc}'"
+                blocks_where_sql += f" AND TRY_CAST(timestamp AS TIMESTAMP) >= TIMESTAMP '{start_utc}'"
             if end_utc is not None:
-                time_filter_sql += f" AND created_time <= TIMESTAMP '{end_utc}'"
+                blocks_where_sql += f" AND TRY_CAST(timestamp AS TIMESTAMP) <= TIMESTAMP '{end_utc}'"
 
             con = duckdb.connect()
             con.execute("PRAGMA temp_directory='/tmp'")
+            con.execute("PRAGMA threads=1")
             query = f"""
-            WITH raw AS (
+            WITH blocks_filtered AS (
                 SELECT
-                    TRY_CAST(b.timestamp AS TIMESTAMP) AS created_time,
+                    block_number,
+                    TRY_CAST(timestamp AS TIMESTAMP) AS created_time
+                FROM read_parquet([{bfiles_str}], hive_partitioning=0)
+                WHERE 1=1
+                {blocks_where_sql}
+            ),
+            raw AS (
+                SELECT
+                    b.created_time AS created_time,
                     CASE
                         WHEN COALESCE(TRY_CAST(t.maker_asset_id AS BIGINT), -1) = 0
                             THEN CAST(t.taker_asset_id AS VARCHAR)
@@ -274,7 +283,6 @@ def load_polymarket_trades(
             SELECT ticker, yes_price, size, taker_side, created_time
             FROM raw
             WHERE yes_price BETWEEN {min_price} AND {max_price}
-            {time_filter_sql}
             {ticker_excl_sql}
             ORDER BY ticker, created_time
             """
