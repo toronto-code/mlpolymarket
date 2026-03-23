@@ -254,6 +254,10 @@ def load_polymarket_trades(
                 while cur <= total_end:
                     cur_period = cur.to_period("M")
                     next_month_start = (cur_period + 1).to_timestamp()
+                    # Pandas Period->Timestamp conversion drops timezone information.
+                    # Re-localize to UTC so comparisons with tz-aware total_end work.
+                    if next_month_start.tzinfo is None:
+                        next_month_start = next_month_start.tz_localize("UTC")
                     end_inclusive = min(total_end, next_month_start - pd.Timedelta(seconds=1))
                     if end_inclusive < cur:
                         break
