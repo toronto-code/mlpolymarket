@@ -1,0 +1,34 @@
+base_config: config/default_batch_month.yaml
+output_root: output/sweep_batch_month_run3
+metric: mae
+minimize: true
+selection_model: lstm
+runs:
+- name: default
+- name: seq_64
+  sequence:
+    length: 64
+  lstm:
+    hidden: 128
+    num_layers: 2
+- name: lstm_large
+  lstm:
+    hidden: 256
+    num_layers: 3
+    dropout: 0.3
+- name: mlp_deep
+  mlp:
+    hidden:
+    - 256
+    - 128
+    - 64
+    - 32
+    dropout: 0.3
+- name: lr_lower
+  training:
+    lr: 0.0005
+  lstm:
+    hidden: 128
+- name: patience_10
+  training:
+    early_stopping_patience: 10

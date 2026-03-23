@@ -243,6 +243,11 @@ def load_polymarket_trades(
                 # boundaries consistent here.
                 total_start = total_start.floor("s")
                 total_end = total_end.floor("s")
+                # Some pandas operations may return tz-naive timestamps; ensure UTC tz-awareness.
+                if getattr(total_start, "tz", None) is None:
+                    total_start = total_start.tz_localize("UTC")
+                if getattr(total_end, "tz", None) is None:
+                    total_end = total_end.tz_localize("UTC")
                 if total_end < total_start:
                     return pd.DataFrame(
                         columns=["ticker", "yes_price", "size", "taker_side", "created_time"]
@@ -252,12 +257,15 @@ def load_polymarket_trades(
                 windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
                 cur = total_start
                 while cur <= total_end:
-                    cur_period = cur.to_period("M")
-                    next_month_start = (cur_period + 1).to_timestamp()
-                    # Pandas Period->Timestamp conversion drops timezone information.
-                    # Re-localize to UTC so comparisons with tz-aware total_end work.
-                    if next_month_start.tzinfo is None:
-                        next_month_start = next_month_start.tz_localize("UTC")
+                    # Avoid pandas Period->Timestamp conversion (it can drop timezone info).
+                    month_start = cur.replace(
+                        day=1,
+                        hour=0,
+                        minute=0,
+                        second=0,
+                        microsecond=0,
+                    )
+                    next_month_start = month_start + pd.DateOffset(months=1)
                     end_inclusive = min(total_end, next_month_start - pd.Timedelta(seconds=1))
                     if end_inclusive < cur:
                         break
