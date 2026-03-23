@@ -78,6 +78,7 @@ def main() -> None:
     exclude_sports = data_cfg.get("exclude_sports", False)
     sports_tickers_file = data_cfg.get("polymarket_sports_tickers_file")
     max_rows = data_cfg.get("max_rows")
+    batch_by_month = data_cfg.get("batch_by_month", False)
 
     exclude_tickers: set[str] = set()
     if exclude_sports and sports_tickers_file:
@@ -97,6 +98,7 @@ def main() -> None:
                 last_n_months=last_n_months,
                 exclude_tickers=exclude_tickers if exclude_tickers else None,
                 max_rows=max_rows,
+                batch_by_month=batch_by_month,
             )
         else:
             trades = load_polymarket_trades(
@@ -104,6 +106,7 @@ def main() -> None:
                 last_n_months=last_n_months,
                 exclude_tickers=exclude_tickers if exclude_tickers else None,
                 max_rows=max_rows,
+                batch_by_month=batch_by_month,
             )
     except FileNotFoundError as e:
         print(e)

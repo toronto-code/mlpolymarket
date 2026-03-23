@@ -166,6 +166,7 @@ def load_polymarket_trades(
     last_n_months: Optional[int] = None,
     exclude_tickers: Optional[set[str]] = None,
     max_rows: Optional[int] = None,
+    batch_by_month: bool = False,
 ) -> pd.DataFrame:
     """
     Load Polymarket CTF Exchange trades from Parquet.
@@ -198,6 +199,98 @@ def load_polymarket_trades(
         bfiles = [f for f in bfiles if not f.name.startswith("._")]
         if bfiles:
             bfiles_str = ", ".join(f"'{f}'" for f in sorted(bfiles))
+
+            # Optional: load month-by-month to reduce DuckDB peak memory.
+            # We ensure non-overlapping windows by using inclusive ends of:
+            #   end_inclusive = next_month_start - 1 second
+            if batch_by_month:
+                if max_rows is not None:
+                    raise ValueError(
+                        "batch_by_month=True is not compatible with max_rows: "
+                        "to preserve 'every data point', remove max_rows from config."
+                    )
+
+                # Compute the max blocks timestamp once; we use it to turn last_n_months
+                # into a concrete window.
+                con_max = duckdb.connect()
+                con_max.execute("PRAGMA temp_directory='/tmp'")
+                max_ts = con_max.execute(
+                    f"SELECT max(timestamp) FROM read_parquet([{bfiles_str}], hive_partitioning=0)"
+                ).fetchone()[0]
+                con_max.close()
+                if max_ts is None:
+                    return pd.DataFrame(
+                        columns=["ticker", "yes_price", "size", "taker_side", "created_time"]
+                    )
+
+                max_dt = pd.to_datetime(max_ts, utc=True)
+
+                if start_date is not None:
+                    total_start = pd.to_datetime(start_date, utc=True)
+                elif last_n_months is not None:
+                    total_start = max_dt - pd.DateOffset(months=int(last_n_months))
+                else:
+                    raise ValueError("batch_by_month=True requires start_date or last_n_months.")
+
+                if end_date is not None:
+                    total_end = pd.to_datetime(end_date, utc=True)
+                elif last_n_months is not None:
+                    total_end = max_dt
+                else:
+                    raise ValueError("batch_by_month=True requires end_date or last_n_months.")
+
+                # We later convert timestamps to seconds precision in SQL strings, so keep
+                # boundaries consistent here.
+                total_start = total_start.floor("s")
+                total_end = total_end.floor("s")
+                if total_end < total_start:
+                    return pd.DataFrame(
+                        columns=["ticker", "yes_price", "size", "taker_side", "created_time"]
+                    )
+
+                # Build non-overlapping monthly windows covering [total_start, total_end].
+                windows: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+                cur = total_start
+                while cur <= total_end:
+                    cur_period = cur.to_period("M")
+                    next_month_start = (cur_period + 1).to_timestamp()
+                    end_inclusive = min(total_end, next_month_start - pd.Timedelta(seconds=1))
+                    if end_inclusive < cur:
+                        break
+                    windows.append((cur, end_inclusive))
+                    cur = end_inclusive + pd.Timedelta(seconds=1)
+
+                print(
+                    f"  Loading trades month-by-month ({len(windows)} windows) to reduce DuckDB peak memory...",
+                    flush=True,
+                )
+
+                dfs: list[pd.DataFrame] = []
+                for i, (ws, we) in enumerate(windows):
+                    print(f"    Window {i + 1}/{len(windows)}: {ws} -> {we}", flush=True)
+                    part = load_polymarket_trades(
+                        data_dir,
+                        blocks_dir=blocks_dir,
+                        min_price=min_price,
+                        max_price=max_price,
+                        start_date=ws,
+                        end_date=we,
+                        last_n_months=None,
+                        exclude_tickers=exclude_tickers,
+                        max_rows=None,
+                        batch_by_month=False,
+                    )
+                    if not part.empty:
+                        dfs.append(part)
+
+                if not dfs:
+                    return pd.DataFrame(
+                        columns=["ticker", "yes_price", "size", "taker_side", "created_time"]
+                    )
+
+                # Concatenate in window order; build_sequences will re-sort per ticker.
+                df_all = pd.concat(dfs, ignore_index=True)
+                return df_all[["ticker", "yes_price", "size", "taker_side", "created_time"]]
 
             # Format optional date filters as UTC timestamps that DuckDB can parse.
             start_utc = (
