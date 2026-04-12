@@ -65,14 +65,15 @@ class MLPModel:
         X, y: (n, seq_len, n_features), (n,). If X_val/y_val provided, use for early stopping.
         Otherwise reserve 20% of X,y as validation.
         """
-        X_flat = X.reshape(X.shape[0], -1).astype(np.float32)
+        # copy=False avoids a redundant allocation when X is already float32.
+        X_flat = X.reshape(X.shape[0], -1).astype(np.float32, copy=False)
         X_t = torch.from_numpy(X_flat).to(self.device)
-        y_t = torch.from_numpy(y).float().unsqueeze(1).to(self.device)
+        y_t = torch.from_numpy(y.astype(np.float32, copy=False)).unsqueeze(1).to(self.device)
 
         if X_val is not None and y_val is not None:
-            X_val_flat = X_val.reshape(X_val.shape[0], -1).astype(np.float32)
+            X_val_flat = X_val.reshape(X_val.shape[0], -1).astype(np.float32, copy=False)
             X_val_t = torch.from_numpy(X_val_flat).to(self.device)
-            y_val_t = torch.from_numpy(y_val).float().unsqueeze(1).to(self.device)
+            y_val_t = torch.from_numpy(y_val.astype(np.float32, copy=False)).unsqueeze(1).to(self.device)
         else:
             n = X_t.size(0)
             val_size = max(1024, n // 5)
@@ -98,20 +99,22 @@ class MLPModel:
 
         for epoch in range(self.max_epochs):
             self._net.train()
+            # Shuffle only the indices, not the data.  Materialising a full
+            # permuted copy of X_t (X_t[perm]) can consume several GB on large
+            # datasets and is the primary training-loop OOM trigger.
             perm = self._rng.permutation(X_t.size(0))
-            X_tr = X_t[perm]
-            y_tr = y_t[perm]
             epoch_loss = 0.0
-            for start in range(0, X_tr.size(0), self.batch_size):
-                end = min(start + self.batch_size, X_tr.size(0))
-                pred = self._net(X_tr[start:end])
-                loss = criterion(pred, y_tr[start:end])
+            for start in range(0, X_t.size(0), self.batch_size):
+                end = min(start + self.batch_size, X_t.size(0))
+                batch_idx = perm[start:end]
+                pred = self._net(X_t[batch_idx])
+                loss = criterion(pred, y_t[batch_idx])
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._net.parameters(), 1.0)
                 opt.step()
                 epoch_loss += loss.item() * (end - start)
-            epoch_loss /= X_tr.size(0)
+            epoch_loss /= X_t.size(0)
 
             self._net.eval()
             with torch.no_grad():
@@ -132,7 +135,7 @@ class MLPModel:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._net is None:
             raise RuntimeError("Model not fitted")
-        X_flat = X.reshape(X.shape[0], -1).astype(np.float32)
+        X_flat = X.reshape(X.shape[0], -1).astype(np.float32, copy=False)
         self._net.eval()
         with torch.no_grad():
             out = self._net(torch.from_numpy(X_flat).to(self.device))

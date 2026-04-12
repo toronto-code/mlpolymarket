@@ -11,6 +11,9 @@ if [[ ! -d ".venv" ]]; then
 fi
 
 DATA_DIR="${DATA_DIR:-$HOME/prediction-market-analysis}"
+# Optional: override YAML (paths relative to repo root or absolute).
+SWEEP_CONFIG="${SWEEP_CONFIG:-config/sweep.yaml}"
+CONFIG="${CONFIG:-}" # for run mode only; if empty, run.py uses its default config
 MODE="${1:-sweep}" # sweep | run
 
 timestamp="$(date +"%Y%m%d_%H%M%S")"
@@ -19,10 +22,14 @@ mkdir -p "$log_dir"
 
 case "$MODE" in
   sweep)
-    cmd=(.venv/bin/python sweep.py --config config/sweep.yaml --data-dir "$DATA_DIR")
+    cmd=(.venv/bin/python sweep.py --config "$SWEEP_CONFIG" --data-dir "$DATA_DIR")
     ;;
   run)
-    cmd=(.venv/bin/python run.py --data-dir "$DATA_DIR")
+    if [[ -n "$CONFIG" ]]; then
+      cmd=(.venv/bin/python run.py --config "$CONFIG" --data-dir "$DATA_DIR")
+    else
+      cmd=(.venv/bin/python run.py --data-dir "$DATA_DIR")
+    fi
     ;;
   *)
     echo "Usage: $0 [sweep|run]"
@@ -33,6 +40,11 @@ esac
 log_file="${log_dir}/${MODE}_${timestamp}.log"
 pid_file="${log_dir}/${MODE}_${timestamp}.pid"
 
+if [[ "$MODE" == "sweep" ]]; then
+  echo "SWEEP_CONFIG=$SWEEP_CONFIG"
+else
+  [[ -n "$CONFIG" ]] && echo "CONFIG=$CONFIG" || echo "CONFIG=(default: config/default.yaml)"
+fi
 echo "Starting: ${cmd[*]}"
 echo "Log: $log_file"
 

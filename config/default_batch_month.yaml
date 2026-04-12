@@ -7,6 +7,16 @@ data:
   exclude_sports: true
   polymarket_sports_tickers_file: data/polymarket/sports_tickers.txt
   batch_by_month: true
+  # Hard cap on the number of sequence windows kept after build_sequences.
+  # This is the primary RAM bottleneck control: X uses
+  #   max_samples × seq_len × n_features × 4 bytes  (float32).
+  # With seq_len=32 and 5 features, rough sizes are:
+  #     500_000  →  ~0.3 GB   (safe on any VM)
+  #   1_000_000  →  ~0.6 GB   (comfortable on 8 GB RAM)
+  #   2_000_000  →  ~1.2 GB   (fine on 16 GB RAM)
+  # Samples are chosen by uniform temporal stride so all time periods are
+  # represented.  Remove or increase the limit once you have a larger VM.
+  max_samples: 1_000_000
 platform: polymarket
 sequence:
   length: 32

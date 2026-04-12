@@ -9,6 +9,8 @@ data:
   last_n_months: 12
   exclude_sports: true
   polymarket_sports_tickers_file: "data/polymarket/sports_tickers.txt"
+  # Uncomment to cap dataset size and prevent OOM.  See default_batch_month.yaml for sizing guide.
+  # max_samples: 1_000_000
 
 platform: "polymarket"
 

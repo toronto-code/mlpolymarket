@@ -4,6 +4,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from numpy.lib.stride_tricks import sliding_window_view
 
 
 def _order_flow(df: pd.DataFrame) -> pd.Series:
@@ -49,37 +50,57 @@ def build_sequences(
     feature_cols = ["yes_price", "size", "order_flow", "vwap", "price_std_5"]
     n_features = len(feature_cols)
 
-    X_list = []
-    y_list = []
-    ticker_list = []
-    ts_list = []
+    # Collect one numpy array per ticker rather than one tiny view per window.
+    # This avoids building a Python list with millions of entries (each a numpy
+    # view object carrying ~200 B of Python overhead), which is often the largest
+    # RAM spike before np.stack is even called.
+    X_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    ticker_parts: list[np.ndarray] = []
+    ts_parts: list[np.ndarray] = []
 
     for ticker, g in trades.groupby("ticker", sort=False):
         g = g.reset_index(drop=True)
-        if len(g) < seq_len + target_horizon or len(g) < min_trades_per_market:
+        n = len(g)
+        if n < seq_len + target_horizon or n < min_trades_per_market:
             continue
-        arr = g[feature_cols].values.astype(np.float32)
+
+        # n_windows: number of valid (window, target) pairs.
+        # Original loop was range(seq_len, n - target_horizon), so the count is:
+        n_windows = n - seq_len - target_horizon
+        if n_windows <= 0:
+            continue
+
+        arr = g[feature_cols].values.astype(np.float32)  # (n, n_features)
         prices = g["yes_price"].values
         times = g["created_time"]
 
-        for i in range(seq_len, len(g) - target_horizon):
-            # Features: last seq_len trades
-            X_list.append(arr[i - seq_len : i])
-            # Target
-            if target_type == "next_price":
-                y_list.append(float(prices[i + target_horizon - 1]))
-            elif target_type == "return_5":
-                p0 = prices[i - 1]
-                p1 = prices[i + target_horizon - 1]
-                y_list.append((p1 - p0) / p0 if p0 else 0.0)
-            else:  # direction_5
-                p0 = prices[i - 1]
-                p1 = prices[i + target_horizon - 1]
-                y_list.append(1.0 if p1 > p0 else 0.0)
-            ticker_list.append(ticker)
-            ts_list.append(times.iloc[i])
+        # sliding_window_view shape: (n - seq_len + 1, n_features, seq_len)
+        # wins[k, f, t] == arr[k + t, f]  →  transpose to (n_windows, seq_len, n_features)
+        wins = sliding_window_view(arr, seq_len, axis=0)
+        # np.ascontiguousarray forces a real copy so arr can be freed immediately.
+        X_ticker = np.ascontiguousarray(wins[:n_windows].transpose(0, 2, 1))
+        del wins, arr  # release the view + the source array
 
-    if not X_list:
+        # Vectorised targets — i in range(seq_len, n - target_horizon)
+        i_arr = np.arange(seq_len, n - target_horizon)  # length == n_windows
+        if target_type == "next_price":
+            y_ticker = prices[i_arr + target_horizon - 1].astype(np.float32)
+        elif target_type == "return_5":
+            p0 = prices[i_arr - 1]
+            p1 = prices[i_arr + target_horizon - 1]
+            y_ticker = np.where(p0 != 0, (p1 - p0) / p0, 0.0).astype(np.float32)
+        else:  # direction_5
+            p0 = prices[i_arr - 1]
+            p1 = prices[i_arr + target_horizon - 1]
+            y_ticker = (p1 > p0).astype(np.float32)
+
+        X_parts.append(X_ticker)
+        y_parts.append(y_ticker)
+        ticker_parts.append(np.full(n_windows, ticker))
+        ts_parts.append(times.iloc[i_arr].values)
+
+    if not X_parts:
         return (
             np.zeros((0, seq_len, n_features), dtype=np.float32),
             np.zeros(0, dtype=np.float32),
@@ -87,10 +108,10 @@ def build_sequences(
             pd.DatetimeIndex([]),
         )
 
-    X = np.stack(X_list, axis=0)
-    y = np.array(y_list, dtype=np.float32)
-    timestamps = pd.DatetimeIndex(ts_list)
-    tickers = np.array(ticker_list)
+    X = np.concatenate(X_parts, axis=0)
+    y = np.concatenate(y_parts, axis=0)
+    timestamps = pd.DatetimeIndex(np.concatenate(ts_parts))
+    tickers = np.concatenate(ticker_parts)
     uniq, ticker_indices = np.unique(tickers, return_inverse=True)
     ticker_indices = ticker_indices.astype(np.int64)
 

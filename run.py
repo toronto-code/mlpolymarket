@@ -8,6 +8,7 @@ Saves best model weights and metrics to output/.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -136,8 +137,34 @@ def main() -> None:
         target_type=target_type,
         target_horizon=target_horizon,
     )
+    # Free the trades DataFrame immediately; X/y/timestamps are all we need from here on.
+    del trades
+    gc.collect()
     n_samples, _, n_features = X.shape
     print("  samples={}, seq_len={}, n_features={}".format(n_samples, seq_len, n_features))
+
+    # Optional hard cap on dataset size — the primary RAM bottleneck.
+    # X occupies  n_samples × seq_len × n_features × 4 bytes  (float32).
+    # Estimate and warn before any subsampling happens.
+    x_gb = n_samples * seq_len * n_features * 4 / 1e9
+    print("  estimated X size: {:.2f} GB".format(x_gb))
+    max_samples = data_cfg.get("max_samples")
+    if max_samples and n_samples > max_samples:
+        # Uniform temporal subsample: sort by time, stride evenly, then restore
+        # chronological order so the time-based train/val/test split still works.
+        time_order = np.argsort(timestamps)
+        step = max(1, len(time_order) // max_samples)
+        keep = np.sort(time_order[::step][:max_samples])
+        X = X[keep]
+        y = y[keep]
+        timestamps = timestamps[keep]
+        n_samples = len(keep)
+        x_gb = n_samples * seq_len * n_features * 4 / 1e9
+        print(
+            "  Subsampled to {:,} samples (max_samples={:,}, ~{:.2f} GB).".format(
+                n_samples, max_samples, x_gb
+            )
+        )
 
     split_cfg = cfg.get("split", {})
     train_frac = split_cfg.get("train_frac", 0.6)
@@ -154,6 +181,9 @@ def main() -> None:
     y_train = y[train_idx]
     y_val = y[val_idx]
     y_test = y[test_idx]
+    # Fancy indexing above always copies, so the originals are now redundant.
+    del X, y
+    gc.collect()
 
     normalize = cfg.get("normalize_features", True)
     if normalize:
