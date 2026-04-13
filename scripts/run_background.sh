@@ -48,9 +48,13 @@ fi
 echo "Starting: ${cmd[*]}"
 echo "Log: $log_file"
 
-# Run in a new session (setsid) so SSH disconnect / SIGHUP never reaches this process.
-# nohup + redirect stdin so it's fully detached from the terminal.
-setsid nohup "${cmd[@]}" >"$log_file" 2>&1 </dev/null &
+# Detach from the terminal so SSH disconnect / SIGHUP never reaches this process.
+# setsid (Linux) creates a new session; macOS falls back to plain nohup.
+if command -v setsid &>/dev/null; then
+  setsid nohup "${cmd[@]}" >"$log_file" 2>&1 </dev/null &
+else
+  nohup "${cmd[@]}" >"$log_file" 2>&1 </dev/null &
+fi
 pid="$!"
 echo "$pid" > "$pid_file"
 disown -h 2>/dev/null || true
