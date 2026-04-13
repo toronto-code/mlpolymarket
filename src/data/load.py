@@ -1,5 +1,6 @@
 """Load Kalshi and Polymarket trade data from Parquet."""
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -167,6 +168,7 @@ def load_polymarket_trades(
     exclude_tickers: Optional[set[str]] = None,
     max_rows: Optional[int] = None,
     batch_by_month: bool = False,
+    _files_override: Optional[list[Path]] = None,
 ) -> pd.DataFrame:
     """
     Load Polymarket CTF Exchange trades from Parquet.
@@ -177,7 +179,7 @@ def load_polymarket_trades(
     path = Path(data_dir)
     if not path.exists():
         raise FileNotFoundError(f"Polymarket trades directory not found: {path}")
-    files = list(path.glob("*.parquet")) or list(path.glob("**/*.parquet"))
+    files = _files_override or (list(path.glob("*.parquet")) or list(path.glob("**/*.parquet")))
     files = [f for f in files if not f.name.startswith("._")]
     if not files:
         return pd.DataFrame(
@@ -190,7 +192,46 @@ def load_polymarket_trades(
     limit_sql = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
     n_files = len(files)
     print(f"  Reading {n_files} parquet files...", flush=True)
-    files_str = ", ".join(f"'{f}'" for f in sorted(files))
+    files_sorted = sorted(files)
+
+    def _files_for_month_window(all_files: list[Path], ws: pd.Timestamp, we: pd.Timestamp) -> list[Path]:
+        """
+        Best-effort pruning of Parquet shard list for a [ws, we] window.
+        Supports common layouts:
+        - Hive partitions: .../year=2026/month=03/...
+        - Filenames containing YYYY-MM or YYYY_MM
+        Falls back to returning all files if no pattern matches.
+        """
+        ws = pd.to_datetime(ws, utc=True)
+        we = pd.to_datetime(we, utc=True)
+        months = pd.period_range(ws.to_period("M"), we.to_period("M"), freq="M")
+        month_keys = {(p.year, p.month) for p in months}
+
+        hive_re = re.compile(r"(?:^|[\\/])year=(\d{4})(?:[\\/])month=(\d{1,2})(?:[\\/]|$)")
+        name_re = re.compile(r"(\d{4})[-_](\d{2})")
+
+        pruned: list[Path] = []
+        matched_any = False
+        for f in all_files:
+            s = str(f)
+            m = hive_re.search(s)
+            if m:
+                matched_any = True
+                y = int(m.group(1))
+                mo = int(m.group(2))
+                if (y, mo) in month_keys:
+                    pruned.append(f)
+                continue
+            m2 = name_re.search(f.name)
+            if m2:
+                matched_any = True
+                y = int(m2.group(1))
+                mo = int(m2.group(2))
+                if (y, mo) in month_keys:
+                    pruned.append(f)
+        return pruned if matched_any and pruned else all_files
+
+    files_str = ", ".join(f"'{f}'" for f in files_sorted)
     # Fast path: when blocks are available, push timestamp join + time filtering down into DuckDB.
     # This avoids materializing the full (potentially huge) trade dataset into pandas first.
     if blocks_dir is not None and Path(blocks_dir).exists():
@@ -281,6 +322,11 @@ def load_polymarket_trades(
                 dfs: list[pd.DataFrame] = []
                 for i, (ws, we) in enumerate(windows):
                     print(f"    Window {i + 1}/{len(windows)}: {ws} -> {we}", flush=True)
+                    # Reduce runtime: point DuckDB only at the subset of shards likely to
+                    # contain this window (if the on-disk layout encodes dates).
+                    month_files = _files_for_month_window(files_sorted, ws, we)
+                    if month_files is not files_sorted:
+                        print(f"      Using {len(month_files):,}/{len(files_sorted):,} parquet shards for this window.", flush=True)
                     part = load_polymarket_trades(
                         data_dir,
                         blocks_dir=blocks_dir,
@@ -292,6 +338,7 @@ def load_polymarket_trades(
                         exclude_tickers=exclude_tickers,
                         max_rows=None,
                         batch_by_month=False,
+                        _files_override=month_files,
                     )
                     if not part.empty:
                         dfs.append(part)
@@ -345,7 +392,8 @@ def load_polymarket_trades(
 
             con = duckdb.connect()
             con.execute("PRAGMA temp_directory='/tmp'")
-            con.execute("PRAGMA threads=1")
+            # Use available CPU to speed up scanning many Parquet shards.
+            con.execute(f"PRAGMA threads={max(1, min(4, os.cpu_count() or 1))}")
             con.execute("PRAGMA memory_limit='6GB'")
             query = f"""
             WITH blocks_filtered AS (
