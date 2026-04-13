@@ -3,7 +3,7 @@ data:
   polymarket_trades: data/polymarket/trades
   polymarket_blocks: data/polymarket/blocks
   polymarket_markets: data/polymarket/markets
-  last_n_months: 12
+  last_n_months: 6
   exclude_sports: true
   polymarket_sports_tickers_file: data/polymarket/sports_tickers.txt
   batch_by_month: true
@@ -16,7 +16,7 @@ data:
   #   2_000_000  →  ~1.2 GB   (fine on 16 GB RAM)
   # Samples are chosen by uniform temporal stride so all time periods are
   # represented.  Remove or increase the limit once you have a larger VM.
-  max_samples: 1_000_000
+  max_samples: 500_000
 platform: polymarket
 sequence:
   length: 32
