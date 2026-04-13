@@ -214,6 +214,7 @@ def load_polymarket_trades(
                 # into a concrete window.
                 con_max = duckdb.connect()
                 con_max.execute("PRAGMA temp_directory='/tmp'")
+                con_max.execute("PRAGMA memory_limit='6GB'")
                 max_ts = con_max.execute(
                     f"SELECT max(timestamp) FROM read_parquet([{bfiles_str}], hive_partitioning=0)"
                 ).fetchone()[0]
@@ -327,6 +328,7 @@ def load_polymarket_trades(
                 # Ensure it points to a writable path so training doesn't fail if the
                 # repo directory isn't writable by the current user.
                 con_max.execute("PRAGMA temp_directory='/tmp'")
+                con_max.execute("PRAGMA memory_limit='6GB'")
                 max_ts = con_max.execute(
                     f"SELECT max(timestamp) FROM read_parquet([{bfiles_str}], hive_partitioning=0)"
                 ).fetchone()[0]
@@ -344,6 +346,7 @@ def load_polymarket_trades(
             con = duckdb.connect()
             con.execute("PRAGMA temp_directory='/tmp'")
             con.execute("PRAGMA threads=1")
+            con.execute("PRAGMA memory_limit='6GB'")
             query = f"""
             WITH blocks_filtered AS (
                 SELECT
