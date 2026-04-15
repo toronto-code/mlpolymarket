@@ -1,0 +1,56 @@
+seed: 42
+
+data:
+  polymarket_trades: data/polymarket/trades
+  polymarket_blocks: data/polymarket/blocks
+  polymarket_markets: data/polymarket/markets
+  last_n_months: 12
+  exclude_sports: true
+  polymarket_sports_tickers_file: data/polymarket/sports_tickers.txt
+  batch_by_month: false   # single DuckDB pass — faster than 13 repeated scans of 40k shards
+  max_samples: 1_000_000  # hard RAM cap; X ~= 0.6 GB at seq_len=32, 5 features
+
+platform: polymarket
+
+sequence:
+  length: 32
+  min_trades_per_market: 100
+
+target:
+  type: next_price
+  horizon: 1
+
+split:
+  train_frac: 0.6
+  val_frac: 0.2
+  test_frac: 0.2
+
+normalize_features: true
+
+models:
+  baseline_last_price: true
+  baseline_vwap: true
+  mlp: true
+  lstm: true
+
+training:
+  batch_size: 512
+  epochs: 50
+  lr: 0.001
+  early_stopping_patience: 7
+  device: cpu
+  seed: 42
+
+mlp:
+  hidden: [128, 64, 32]
+  dropout: 0.2
+
+lstm:
+  hidden: 128
+  num_layers: 2
+  dropout: 0.2
+
+output:
+  dir: output/run_12m_singlepass
+  save_models: true
+  save_metrics: true
