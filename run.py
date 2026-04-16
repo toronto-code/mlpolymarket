@@ -80,6 +80,8 @@ def main() -> None:
     sports_tickers_file = data_cfg.get("polymarket_sports_tickers_file")
     max_rows = data_cfg.get("max_rows")
     batch_by_month = data_cfg.get("batch_by_month", False)
+    consolidated_key = data_cfg.get("polymarket_consolidated")
+    consolidated_path = (data_root / consolidated_key) if consolidated_key else None
 
     exclude_tickers: set[str] = set()
     if exclude_sports and sports_tickers_file:
@@ -92,7 +94,16 @@ def main() -> None:
 
     print("Loading Polymarket trades (last {} months)...".format(last_n_months))
     try:
-        if blocks_path.exists():
+        if consolidated_path is not None:
+            # Fast path: single pre-joined parquet, loads in seconds.
+            trades = load_polymarket_trades(
+                trades_path,
+                consolidated_path=consolidated_path,
+                last_n_months=last_n_months,
+                exclude_tickers=exclude_tickers if exclude_tickers else None,
+                max_rows=max_rows,
+            )
+        elif blocks_path.exists():
             trades = load_polymarket_trades(
                 trades_path,
                 blocks_dir=blocks_path,

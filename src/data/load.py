@@ -156,10 +156,83 @@ def load_polymarket_blocks(data_dir: str | Path) -> pd.DataFrame:
     return df
 
 
+def _load_from_consolidated(
+    consolidated_path: Path,
+    *,
+    min_price: float = 0.01,
+    max_price: float = 0.99,
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
+    last_n_months: Optional[int] = None,
+    exclude_tickers: Optional[set[str]] = None,
+    max_rows: Optional[int] = None,
+) -> pd.DataFrame:
+    """
+    Fast path: load from a single pre-joined consolidated Parquet file produced
+    by scripts/prepare_data.py.  This skips the expensive multi-shard DuckDB
+    join entirely — typical load time drops from hours to seconds.
+    """
+    con = duckdb.connect()
+    con.execute("PRAGMA temp_directory='/tmp'")
+    con.execute("PRAGMA memory_limit='8GB'")
+    con.execute(f"PRAGMA threads={max(1, min(4, os.cpu_count() or 1))}")
+
+    where: list[str] = [
+        f"yes_price BETWEEN {min_price} AND {max_price}"
+    ]
+
+    if last_n_months is not None:
+        max_ts = con.execute(
+            f"SELECT max(created_time) FROM read_parquet('{consolidated_path}')"
+        ).fetchone()[0]
+        if max_ts is not None:
+            cutoff = (
+                pd.to_datetime(max_ts, utc=True)
+                - pd.DateOffset(months=int(last_n_months))
+            )
+            where.append(
+                f"created_time >= TIMESTAMP '{cutoff.strftime('%Y-%m-%d %H:%M:%S')}'"
+            )
+
+    if start_date is not None:
+        s = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        where.append(f"created_time >= TIMESTAMP '{s}'")
+
+    if end_date is not None:
+        e = pd.to_datetime(end_date, utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        where.append(f"created_time <= TIMESTAMP '{e}'")
+
+    if exclude_tickers:
+        tl = ", ".join(f"'{t}'" for t in sorted(exclude_tickers))
+        where.append(f"ticker NOT IN ({tl})")
+
+    limit_sql = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
+    where_sql = " AND ".join(where)
+
+    query = f"""
+    SELECT ticker, yes_price, size, taker_side, created_time
+    FROM read_parquet('{consolidated_path}')
+    WHERE {where_sql}
+    {limit_sql}
+    """
+    df = con.execute(query).df()
+    con.close()
+
+    if df.empty:
+        return pd.DataFrame(
+            columns=["ticker", "yes_price", "size", "taker_side", "created_time"]
+        )
+
+    df["created_time"] = pd.to_datetime(df["created_time"], utc=True)
+    print(f"  Loaded {len(df):,} rows from consolidated file.", flush=True)
+    return df[["ticker", "yes_price", "size", "taker_side", "created_time"]]
+
+
 def load_polymarket_trades(
     data_dir: str | Path,
     blocks_dir: Optional[str | Path] = None,
     *,
+    consolidated_path: Optional[str | Path] = None,
     min_price: float = 0.01,
     max_price: float = 0.99,
     start_date: Optional[pd.Timestamp] = None,
@@ -175,7 +248,38 @@ def load_polymarket_trades(
     Derives price from maker/taker amounts (maker_asset_id=0 means USDC).
     Returns DataFrame with columns: ticker, yes_price (0-1), size, taker_side, created_time.
     Optional time filters: start_date, end_date (inclusive), or last_n_months from latest trade.
+
+    Fast path: if consolidated_path points to a file produced by
+    scripts/prepare_data.py, loading takes seconds instead of hours.
     """
+    # ------------------------------------------------------------------ #
+    # Fast path: consolidated file (pre-joined, single parquet)           #
+    # ------------------------------------------------------------------ #
+    if consolidated_path is not None:
+        cp = Path(consolidated_path)
+        if cp.exists():
+            print(f"  Using consolidated file: {cp}", flush=True)
+            return _load_from_consolidated(
+                cp,
+                min_price=min_price,
+                max_price=max_price,
+                start_date=start_date,
+                end_date=end_date,
+                last_n_months=last_n_months,
+                exclude_tickers=exclude_tickers,
+                max_rows=max_rows,
+            )
+        else:
+            print(
+                f"  WARNING: consolidated_path set but file not found: {cp}\n"
+                f"  Run scripts/prepare_data.py first, or unset polymarket_consolidated.\n"
+                f"  Falling back to raw shard loading (slow).",
+                flush=True,
+            )
+
+    # ------------------------------------------------------------------ #
+    # Slow path: raw shards                                               #
+    # ------------------------------------------------------------------ #
     path = Path(data_dir)
     if not path.exists():
         raise FileNotFoundError(f"Polymarket trades directory not found: {path}")

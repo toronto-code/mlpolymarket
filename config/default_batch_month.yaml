@@ -7,6 +7,8 @@ data:
   exclude_sports: true
   polymarket_sports_tickers_file: data/polymarket/sports_tickers.txt
   batch_by_month: true
+  # Uncomment after running scripts/prepare_data.py (cuts load time from hours to seconds):
+  # polymarket_consolidated: data/polymarket/consolidated/trades_with_timestamps.parquet
   # Hard cap on the number of sequence windows kept after build_sequences.
   # This is the primary RAM bottleneck control: X uses
   #   max_samples × seq_len × n_features × 4 bytes  (float32).

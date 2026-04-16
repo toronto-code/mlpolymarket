@@ -9,6 +9,8 @@ data:
   polymarket_sports_tickers_file: data/polymarket/sports_tickers.txt
   batch_by_month: false   # single DuckDB pass — faster than 13 repeated scans of 40k shards
   max_samples: 1_000_000  # hard RAM cap; X ~= 0.6 GB at seq_len=32, 5 features
+  # Uncomment after running scripts/prepare_data.py (cuts load time from hours to seconds):
+  # polymarket_consolidated: data/polymarket/consolidated/trades_with_timestamps.parquet
 
 platform: polymarket
 
