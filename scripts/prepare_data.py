@@ -199,16 +199,32 @@ def prepare(
         temp_files.append(temp_path)
 
         if resume and temp_path.exists():
-            count = con.execute(
-                f"SELECT count(*) FROM read_parquet('{temp_path}')"
-            ).fetchone()[0]
-            print(
-                f"  [{i + 1}/{len(windows)}] {ws.date()} → {we.date()} "
-                f"SKIPPED (exists, {count:,} rows)",
-                flush=True,
-            )
-            total_rows += count
-            continue
+            try:
+                count = con.execute(
+                    f"SELECT count(*) FROM read_parquet('{temp_path}')"
+                ).fetchone()[0]
+                if count > 0:
+                    print(
+                        f"  [{i + 1}/{len(windows)}] {ws.date()} → {we.date()} "
+                        f"SKIPPED (exists, {count:,} rows)",
+                        flush=True,
+                    )
+                    total_rows += count
+                    continue
+                else:
+                    print(
+                        f"  [{i + 1}/{len(windows)}] {ws.date()} → {we.date()} "
+                        f"temp file empty, re-running...",
+                        flush=True,
+                    )
+                    temp_path.unlink()
+            except Exception:
+                print(
+                    f"  [{i + 1}/{len(windows)}] {ws.date()} → {we.date()} "
+                    f"temp file corrupt, re-running...",
+                    flush=True,
+                )
+                temp_path.unlink()
 
         print(
             f"  [{i + 1}/{len(windows)}] {ws.date()} → {we.date()} ...",
