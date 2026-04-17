@@ -16,16 +16,27 @@ class SequenceScaler:
         self._std: np.ndarray | None = None
 
     def fit(self, X: np.ndarray) -> "SequenceScaler":
-        # X: (n, seq_len, n_features). Compute mean/std per feature (last dim).
         self._mean = np.nanmean(X, axis=(0, 1)).astype(np.float32)
         self._std = np.nanstd(X, axis=(0, 1)).astype(np.float32)
         self._std[self._std < 1e-8] = 1.0
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
+    def transform(self, X: np.ndarray, inplace: bool = False) -> np.ndarray:
+        """Normalise X.
+
+        If ``inplace=True`` and X is float32, the subtraction and division are
+        done in-place. This halves peak memory on large tensors where X can be
+        many GB (the default ``(X - mean) / std`` would otherwise allocate two
+        full-size temporaries).
+        """
         if self._mean is None or self._std is None:
             raise RuntimeError("Scaler not fitted")
+        if inplace and X.dtype == np.float32:
+            # Broadcasting over the last axis works with in-place ops.
+            np.subtract(X, self._mean, out=X)
+            np.divide(X, self._std, out=X)
+            return X
         return ((X - self._mean) / self._std).astype(np.float32)
 
-    def fit_transform(self, X: np.ndarray) -> np.ndarray:
-        return self.fit(X).transform(X)
+    def fit_transform(self, X: np.ndarray, inplace: bool = False) -> np.ndarray:
+        return self.fit(X).transform(X, inplace=inplace)

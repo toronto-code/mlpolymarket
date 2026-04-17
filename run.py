@@ -140,6 +140,12 @@ def main() -> None:
     target_type = target_cfg.get("type", "next_price")
     target_horizon = target_cfg.get("horizon", 1)
 
+    # max_samples is the primary RAM dial on this box — it's enforced *inside*
+    # build_sequences by striding per-ticker windows, so we never allocate a
+    # bigger X than we intend to keep. This was the OOM culprit when it was
+    # applied post-hoc.
+    max_samples = data_cfg.get("max_samples")
+
     print("Building sequences...")
     X, y, _, timestamps = build_sequences(
         trades,
@@ -147,35 +153,20 @@ def main() -> None:
         min_trades_per_market=min_trades,
         target_type=target_type,
         target_horizon=target_horizon,
+        max_samples=max_samples,
     )
     # Free the trades DataFrame immediately; X/y/timestamps are all we need from here on.
     del trades
     gc.collect()
     n_samples, _, n_features = X.shape
-    print("  samples={}, seq_len={}, n_features={}".format(n_samples, seq_len, n_features))
-
-    # Optional hard cap on dataset size — the primary RAM bottleneck.
-    # X occupies  n_samples × seq_len × n_features × 4 bytes  (float32).
-    # Estimate and warn before any subsampling happens.
     x_gb = n_samples * seq_len * n_features * 4 / 1e9
-    print("  estimated X size: {:.2f} GB".format(x_gb))
-    max_samples = data_cfg.get("max_samples")
-    if max_samples and n_samples > max_samples:
-        # Uniform temporal subsample: sort by time, stride evenly, then restore
-        # chronological order so the time-based train/val/test split still works.
-        time_order = np.argsort(timestamps)
-        step = max(1, len(time_order) // max_samples)
-        keep = np.sort(time_order[::step][:max_samples])
-        X = X[keep]
-        y = y[keep]
-        timestamps = timestamps[keep]
-        n_samples = len(keep)
-        x_gb = n_samples * seq_len * n_features * 4 / 1e9
-        print(
-            "  Subsampled to {:,} samples (max_samples={:,}, ~{:.2f} GB).".format(
-                n_samples, max_samples, x_gb
-            )
+    print(
+        "  samples={:,}, seq_len={}, n_features={}  (X ~= {:.2f} GB)".format(
+            n_samples, seq_len, n_features, x_gb
         )
+    )
+    if max_samples:
+        print("  max_samples cap: {:,}".format(max_samples))
 
     split_cfg = cfg.get("split", {})
     train_frac = split_cfg.get("train_frac", 0.6)
@@ -186,23 +177,28 @@ def main() -> None:
     )
     print("  train={}, val={}, test={}".format(len(train_idx), len(val_idx), len(test_idx)))
 
-    X_train = X[train_idx]
-    X_val = X[val_idx]
-    X_test = X[test_idx]
-    y_train = y[train_idx]
-    y_val = y[val_idx]
-    y_test = y[test_idx]
-    # Fancy indexing above always copies, so the originals are now redundant.
-    del X, y
-    gc.collect()
+    # Contiguous splits: the time-based split returns np.arange ranges, so we
+    # can use plain slicing to get *views* instead of fancy-indexing copies.
+    # This saves one full copy of X (several GB on the 12-month run).
+    t1 = int(len(train_idx))
+    t2 = t1 + int(len(val_idx))
+    X_train = X[:t1]
+    X_val = X[t1:t2]
+    X_test = X[t2:]
+    y_train = y[:t1]
+    y_val = y[t1:t2]
+    y_test = y[t2:]
 
     normalize = cfg.get("normalize_features", True)
     if normalize:
         scaler = SequenceScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_val = scaler.transform(X_val)
-        X_test = scaler.transform(X_test)
-        print("  features normalized (mean/std on train)")
+        # In-place normalization writes back into X (which X_train/val/test view).
+        # Avoids allocating two full-size temporaries from (X - mean) / std.
+        scaler.fit(X_train)
+        scaler.transform(X_train, inplace=True)
+        scaler.transform(X_val, inplace=True)
+        scaler.transform(X_test, inplace=True)
+        print("  features normalized (mean/std on train, in-place)")
 
     last_price_test = X_test[:, -1, 0]
 
@@ -262,6 +258,10 @@ def main() -> None:
             state = m.get_state_dict()
             torch.save(state, out_dir / "mlp_best.pt")
             saved_artifacts["mlp"] = str(out_dir / "mlp_best.pt")
+        # Release the fitted MLP (and its internal torch tensors) before the
+        # LSTM allocates its own — avoids holding two models plus the data.
+        del m
+        gc.collect()
 
     if models_cfg.get("lstm", True) and not args.no_lstm:
         print("Training LSTM...")
@@ -287,6 +287,8 @@ def main() -> None:
             state = m.get_state_dict()
             torch.save(state, out_dir / "lstm_best.pt")
             saved_artifacts["lstm"] = str(out_dir / "lstm_best.pt")
+        del m
+        gc.collect()
 
     print("\n--- Test set metrics ---\n")
     for name, metrics in results.items():
