@@ -3,7 +3,7 @@
 import os
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import duckdb
 import numpy as np
@@ -156,6 +156,139 @@ def load_polymarket_blocks(data_dir: str | Path) -> pd.DataFrame:
     return df
 
 
+def _duckdb_escape_path(p: Path) -> str:
+    return str(p.resolve()).replace("'", "''")
+
+
+def build_consolidated_trades_sql(
+    consolidated_path: Path,
+    con: duckdb.DuckDBPyConnection,
+    *,
+    min_price: float = 0.01,
+    max_price: float = 0.99,
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
+    last_n_months: Optional[int] = None,
+    exclude_tickers: Optional[set[str]] = None,
+    max_rows: Optional[int] = None,
+    order_by_ticker_time: bool = False,
+) -> str:
+    """Build SELECT for consolidated Polymarket parquet (shared by bulk load + streaming)."""
+    path_esc = _duckdb_escape_path(consolidated_path)
+    where: list[str] = [f"yes_price BETWEEN {min_price} AND {max_price}"]
+
+    if last_n_months is not None:
+        max_ts = con.execute(
+            f"SELECT max(created_time) FROM read_parquet('{path_esc}')"
+        ).fetchone()[0]
+        if max_ts is not None:
+            cutoff = pd.to_datetime(max_ts, utc=True) - pd.DateOffset(months=int(last_n_months))
+            where.append(f"created_time >= TIMESTAMP '{cutoff.strftime('%Y-%m-%d %H:%M:%S')}'")
+
+    if start_date is not None:
+        s = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        where.append(f"created_time >= TIMESTAMP '{s}'")
+
+    if end_date is not None:
+        e = pd.to_datetime(end_date, utc=True).strftime("%Y-%m-%d %H:%M:%S")
+        where.append(f"created_time <= TIMESTAMP '{e}'")
+
+    if exclude_tickers:
+        tl = ", ".join(f"'{t}'" for t in sorted(exclude_tickers))
+        where.append(f"ticker NOT IN ({tl})")
+
+    limit_sql = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
+    where_sql = " AND ".join(where)
+    order_sql = "ORDER BY ticker, created_time" if order_by_ticker_time else ""
+
+    return f"""
+    SELECT ticker, yes_price, size, taker_side, created_time
+    FROM read_parquet('{path_esc}')
+    WHERE {where_sql}
+    {order_sql}
+    {limit_sql}
+    """
+
+
+def iter_consolidated_trades_batches(
+    consolidated_path: str | Path,
+    *,
+    min_price: float = 0.01,
+    max_price: float = 0.99,
+    start_date: Optional[pd.Timestamp] = None,
+    end_date: Optional[pd.Timestamp] = None,
+    last_n_months: Optional[int] = None,
+    exclude_tickers: Optional[set[str]] = None,
+    max_rows: Optional[int] = None,
+    chunk_rows: int = 350_000,
+    duckdb_memory_limit: str = "4GB",
+) -> Iterator[pd.DataFrame]:
+    """
+    Stream rows from a consolidated parquet through DuckDB in bounded-size DataFrames.
+
+    ``ORDER BY ticker, created_time`` is required so callers can finish one ticker
+    at a time without holding the full table in RAM (avoids the ~30GB+ pandas
+    materialisation from ``.df()`` on the full result).
+
+    Note: DuckDB's ``fetch_df_chunk(n)`` takes **vectors per chunk**, not rows.
+    With default vector size 1024, ``chunk_rows`` is converted to an approximate
+    vector count so each pandas batch stays near the requested row budget.
+    """
+    cp = Path(consolidated_path)
+    con = duckdb.connect()
+    con.execute("PRAGMA temp_directory='/tmp'")
+    con.execute(f"PRAGMA memory_limit='{duckdb_memory_limit}'")
+    con.execute(f"PRAGMA threads={max(1, min(4, os.cpu_count() or 1))}")
+
+    query = build_consolidated_trades_sql(
+        cp,
+        con,
+        min_price=min_price,
+        max_price=max_price,
+        start_date=start_date,
+        end_date=end_date,
+        last_n_months=last_n_months,
+        exclude_tickers=exclude_tickers,
+        max_rows=max_rows,
+        order_by_ticker_time=True,
+    ).strip()
+
+    _duckdb_vector_rows = 1024
+    chunk_vectors = max(1, (int(chunk_rows) + _duckdb_vector_rows - 1) // _duckdb_vector_rows)
+
+    print(
+        f"  Streaming consolidated parquet (~{chunk_rows:,} rows/batch ≈ {chunk_vectors} DuckDB vectors)...",
+        flush=True,
+    )
+    result = con.execute(query)
+    fetch_chunk = getattr(result, "fetch_df_chunk", None)
+    if fetch_chunk is None:
+        con.close()
+        raise RuntimeError(
+            "Your DuckDB build has no fetch_df_chunk(); upgrade: pip install -U duckdb"
+        )
+
+    batch_i = 0
+    total = 0
+    try:
+        while True:
+            chunk = fetch_chunk(chunk_vectors)
+            if chunk is None or len(chunk) == 0:
+                break
+            chunk["created_time"] = pd.to_datetime(chunk["created_time"], utc=True)
+            batch_i += 1
+            total += len(chunk)
+            if batch_i == 1 or batch_i % 10 == 0:
+                print(
+                    f"    ... batch {batch_i}: +{len(chunk):,} rows (cumulative {total:,})",
+                    flush=True,
+                )
+            yield chunk[["ticker", "yes_price", "size", "taker_side", "created_time"]]
+    finally:
+        con.close()
+        print(f"  Finished streaming {total:,} trade rows in {batch_i} batches.", flush=True)
+
+
 def _load_from_consolidated(
     consolidated_path: Path,
     *,
@@ -177,44 +310,19 @@ def _load_from_consolidated(
     con.execute("PRAGMA memory_limit='8GB'")
     con.execute(f"PRAGMA threads={max(1, min(4, os.cpu_count() or 1))}")
 
-    where: list[str] = [
-        f"yes_price BETWEEN {min_price} AND {max_price}"
-    ]
+    query = build_consolidated_trades_sql(
+        consolidated_path,
+        con,
+        min_price=min_price,
+        max_price=max_price,
+        start_date=start_date,
+        end_date=end_date,
+        last_n_months=last_n_months,
+        exclude_tickers=exclude_tickers,
+        max_rows=max_rows,
+        order_by_ticker_time=False,
+    ).strip()
 
-    if last_n_months is not None:
-        max_ts = con.execute(
-            f"SELECT max(created_time) FROM read_parquet('{consolidated_path}')"
-        ).fetchone()[0]
-        if max_ts is not None:
-            cutoff = (
-                pd.to_datetime(max_ts, utc=True)
-                - pd.DateOffset(months=int(last_n_months))
-            )
-            where.append(
-                f"created_time >= TIMESTAMP '{cutoff.strftime('%Y-%m-%d %H:%M:%S')}'"
-            )
-
-    if start_date is not None:
-        s = pd.to_datetime(start_date, utc=True).strftime("%Y-%m-%d %H:%M:%S")
-        where.append(f"created_time >= TIMESTAMP '{s}'")
-
-    if end_date is not None:
-        e = pd.to_datetime(end_date, utc=True).strftime("%Y-%m-%d %H:%M:%S")
-        where.append(f"created_time <= TIMESTAMP '{e}'")
-
-    if exclude_tickers:
-        tl = ", ".join(f"'{t}'" for t in sorted(exclude_tickers))
-        where.append(f"ticker NOT IN ({tl})")
-
-    limit_sql = f"LIMIT {int(max_rows)}" if max_rows is not None else ""
-    where_sql = " AND ".join(where)
-
-    query = f"""
-    SELECT ticker, yes_price, size, taker_side, created_time
-    FROM read_parquet('{consolidated_path}')
-    WHERE {where_sql}
-    {limit_sql}
-    """
     df = con.execute(query).df()
     con.close()
 

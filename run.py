@@ -24,7 +24,11 @@ import yaml
 
 from src.data.load import load_polymarket_trades, load_sports_ticker_ids_file
 from src.data.scaler import SequenceScaler
-from src.data.sequences import build_sequences, time_based_split_three_way
+from src.data.sequences import (
+    build_sequences,
+    build_sequences_from_consolidated,
+    time_based_split_three_way,
+)
 from src.eval.metrics import compute_metrics, print_metrics
 from src.models.baselines import LastPriceBaseline, VWAPBaseline
 from src.models.mlp import MLPModel
@@ -92,10 +96,25 @@ def main() -> None:
         else:
             print("exclude_sports is true but no tickers in {} (run scripts/generate_sports_tickers.py?).".format(sports_path))
 
+    seq_cfg = cfg.get("sequence", {})
+    seq_len = seq_cfg.get("length", 32)
+    min_trades = seq_cfg.get("min_trades_per_market", 100)
+    target_cfg = cfg.get("target", {})
+    target_type = target_cfg.get("type", "next_price")
+    target_horizon = target_cfg.get("horizon", 1)
+    max_samples = data_cfg.get("max_samples")
+
+    consolidated_exists = consolidated_path is not None and consolidated_path.exists()
+    trades = None
+
     print("Loading Polymarket trades (last {} months)...".format(last_n_months))
     try:
-        if consolidated_path is not None:
-            # Fast path: single pre-joined parquet, loads in seconds.
+        if consolidated_exists:
+            print(
+                "  Consolidated parquet found — using streaming loader (no full-RAM pandas materialisation).",
+                flush=True,
+            )
+        elif consolidated_path is not None:
             trades = load_polymarket_trades(
                 trades_path,
                 consolidated_path=consolidated_path,
@@ -125,40 +144,53 @@ def main() -> None:
         print("Point --data-dir to the repo that contains data/polymarket/trades and blocks.")
         return
 
-    if trades.empty:
-        print("No trades in the requested window. Check path and last_n_months.")
-        return
-
-    if args.max_markets:
-        tickers = trades["ticker"].unique()[: args.max_markets]
-        trades = trades[trades["ticker"].isin(tickers)]
-
-    seq_cfg = cfg.get("sequence", {})
-    seq_len = seq_cfg.get("length", 32)
-    min_trades = seq_cfg.get("min_trades_per_market", 100)
-    target_cfg = cfg.get("target", {})
-    target_type = target_cfg.get("type", "next_price")
-    target_horizon = target_cfg.get("horizon", 1)
-
-    # max_samples is the primary RAM dial on this box — it's enforced *inside*
-    # build_sequences by striding per-ticker windows, so we never allocate a
-    # bigger X than we intend to keep. This was the OOM culprit when it was
-    # applied post-hoc.
-    max_samples = data_cfg.get("max_samples")
+    if not consolidated_exists:
+        if trades is None or trades.empty:
+            print("No trades in the requested window. Check path and last_n_months.")
+            return
+        if args.max_markets:
+            tickers = trades["ticker"].unique()[: args.max_markets]
+            trades = trades[trades["ticker"].isin(tickers)]
+    elif args.max_markets:
+        print("Note: --max-markets is ignored when training from an on-disk consolidated parquet.")
 
     print("Building sequences...")
-    X, y, _, timestamps = build_sequences(
-        trades,
-        seq_len=seq_len,
-        min_trades_per_market=min_trades,
-        target_type=target_type,
-        target_horizon=target_horizon,
-        max_samples=max_samples,
-    )
-    # Free the trades DataFrame immediately; X/y/timestamps are all we need from here on.
-    del trades
+    if consolidated_exists:
+        iter_kw = {
+            "min_price": 0.01,
+            "max_price": 0.99,
+            "start_date": None,
+            "end_date": None,
+            "last_n_months": last_n_months,
+            "exclude_tickers": exclude_tickers if exclude_tickers else None,
+            "max_rows": max_rows,
+            "chunk_rows": int(data_cfg.get("consolidated_chunk_rows", 350_000)),
+            "duckdb_memory_limit": str(data_cfg.get("duckdb_memory_limit", "4GB")),
+        }
+        X, y, _, timestamps = build_sequences_from_consolidated(
+            consolidated_path,
+            seq_len=seq_len,
+            min_trades_per_market=min_trades,
+            target_type=target_type,
+            target_horizon=target_horizon,
+            max_samples=max_samples,
+            iter_batch_kw=iter_kw,
+        )
+    else:
+        X, y, _, timestamps = build_sequences(
+            trades,
+            seq_len=seq_len,
+            min_trades_per_market=min_trades,
+            target_type=target_type,
+            target_horizon=target_horizon,
+            max_samples=max_samples,
+        )
+        del trades
     gc.collect()
     n_samples, _, n_features = X.shape
+    if n_samples == 0:
+        print("No sequence samples produced. Check data window, min_trades, and filters.")
+        return
     x_gb = n_samples * seq_len * n_features * 4 / 1e9
     print(
         "  samples={:,}, seq_len={}, n_features={}  (X ~= {:.2f} GB)".format(

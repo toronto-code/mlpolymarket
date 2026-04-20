@@ -10,11 +10,14 @@ with the output tensor in memory.
 from __future__ import annotations
 
 import gc
-from typing import Literal, Optional
+from pathlib import Path
+from typing import Any, Literal, Optional
 
 import numpy as np
 import pandas as pd
 from numpy.lib.stride_tricks import sliding_window_view
+
+from .load import iter_consolidated_trades_batches
 
 
 _FEATURE_COLS = ["yes_price", "size", "order_flow", "vwap", "price_std_5"]
@@ -38,6 +41,264 @@ def _per_ticker_stats(prices: np.ndarray, sizes: np.ndarray) -> tuple[np.ndarray
         pd.Series(prices).rolling(5, min_periods=1).std().fillna(0.0).to_numpy(dtype=np.float32)
     )
     return vwap, price_std_5
+
+
+def _merge_remainder(remainder: pd.DataFrame, chunk: pd.DataFrame) -> pd.DataFrame:
+    if remainder is None or len(remainder) == 0:
+        return chunk
+    return pd.concat([remainder, chunk], ignore_index=True)
+
+
+def _split_complete_remainder(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split so ``complete`` ends on full ticker groups; ``remainder`` is the last (open) ticker."""
+    if df.empty:
+        return df, pd.DataFrame(columns=df.columns)
+    last = df["ticker"].iloc[-1]
+    k = len(df) - 1
+    while k >= 0 and df["ticker"].iloc[k] == last:
+        k -= 1
+    return df.iloc[: k + 1], df.iloc[k + 1 :]
+
+
+def _iter_valid_ticker_segments(
+    df: pd.DataFrame,
+    seq_len: int,
+    min_trades: int,
+    target_horizon: int,
+):
+    tickers_col = df["ticker"].to_numpy()
+    n = len(df)
+    if n == 0:
+        return
+    change = np.flatnonzero(tickers_col[1:] != tickers_col[:-1]) + 1
+    starts = np.concatenate([[0], change])
+    ends = np.concatenate([change, [n]])
+    for i in range(len(starts)):
+        s, e = int(starts[i]), int(ends[i])
+        nn = e - s
+        if nn < seq_len + target_horizon or nn < min_trades:
+            continue
+        nw = nn - seq_len - target_horizon
+        if nw > 0:
+            yield s, e, nw
+
+
+def _emit_ticker_windows(
+    prices_g: np.ndarray,
+    sizes_g: np.ndarray,
+    oflow_g: np.ndarray,
+    times_g: np.ndarray,
+    *,
+    seq_len: int,
+    min_trades: int,
+    target_horizon: int,
+    target_type: Literal["next_price", "return_5", "direction_5"],
+    stride: int,
+    X: np.ndarray,
+    y: np.ndarray,
+    ts_out: np.ndarray,
+    ticker_idx_out: np.ndarray,
+    write: int,
+    local_ticker_idx: int,
+) -> int:
+    n = int(prices_g.shape[0])
+    if n < seq_len + target_horizon or n < min_trades:
+        return write
+    nw = n - seq_len - target_horizon
+    if nw <= 0:
+        return write
+
+    vwap_g, pstd5_g = _per_ticker_stats(prices_g, sizes_g)
+    feat = np.empty((n, _N_FEATURES), dtype=np.float32)
+    feat[:, 0] = prices_g
+    feat[:, 1] = sizes_g
+    feat[:, 2] = oflow_g
+    feat[:, 3] = vwap_g
+    feat[:, 4] = pstd5_g
+    wins = sliding_window_view(feat, seq_len, axis=0)
+    sel = np.arange(0, nw, stride, dtype=np.int64)
+    n_kept = int(sel.shape[0])
+    if n_kept == 0:
+        del wins, feat, vwap_g, pstd5_g
+        return write
+
+    X[write : write + n_kept] = wins[sel].transpose(0, 2, 1)
+    i_arr = seq_len + sel
+    if target_type == "next_price":
+        y[write : write + n_kept] = prices_g[i_arr + target_horizon - 1]
+    elif target_type == "return_5":
+        p0 = prices_g[i_arr - 1]
+        p1 = prices_g[i_arr + target_horizon - 1]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            y[write : write + n_kept] = np.where(p0 != 0, (p1 - p0) / p0, 0.0)
+    else:
+        p0 = prices_g[i_arr - 1]
+        p1 = prices_g[i_arr + target_horizon - 1]
+        y[write : write + n_kept] = (p1 > p0).astype(np.float32)
+
+    ts_out[write : write + n_kept] = times_g[i_arr]
+    ticker_idx_out[write : write + n_kept] = local_ticker_idx
+    del wins, feat, vwap_g, pstd5_g
+    return write + n_kept
+
+
+def _collect_nw_list_streaming(
+    consolidated_path: Path,
+    iter_batch_kw: dict[str, Any],
+    seq_len: int,
+    min_trades: int,
+    target_horizon: int,
+) -> list[int]:
+    nw_list: list[int] = []
+    remainder = pd.DataFrame()
+    for chunk in iter_consolidated_trades_batches(consolidated_path, **iter_batch_kw):
+        df = _merge_remainder(remainder, chunk)
+        complete, remainder = _split_complete_remainder(df)
+        if not complete.empty:
+            for _, _, nw in _iter_valid_ticker_segments(
+                complete, seq_len, min_trades, target_horizon
+            ):
+                nw_list.append(nw)
+    if not remainder.empty:
+        for _, _, nw in _iter_valid_ticker_segments(
+            remainder, seq_len, min_trades, target_horizon
+        ):
+            nw_list.append(nw)
+    return nw_list
+
+
+def _fill_streaming_pass2(
+    consolidated_path: Path,
+    iter_batch_kw: dict[str, Any],
+    nw_list: list[int],
+    stride: int,
+    seq_len: int,
+    min_trades: int,
+    target_horizon: int,
+    target_type: Literal["next_price", "return_5", "direction_5"],
+    X: np.ndarray,
+    y: np.ndarray,
+    ts_out: np.ndarray,
+    ticker_idx_out: np.ndarray,
+) -> None:
+    idx_nw = 0
+    write = 0
+    local_ticker = 0
+    remainder = pd.DataFrame()
+
+    def _flush_frame(frame: pd.DataFrame) -> None:
+        nonlocal idx_nw, write, local_ticker
+        if frame.empty:
+            return
+        prices = frame["yes_price"].to_numpy(dtype=np.float32, copy=False)
+        sizes = frame["size"].to_numpy(dtype=np.float32, copy=False)
+        taker = frame["taker_side"].astype(str).str.lower().to_numpy()
+        oflow = np.where(taker == "yes", sizes, -sizes).astype(np.float32, copy=False)
+        times = frame["created_time"].to_numpy(dtype="datetime64[ns]")
+        for s, e, nw in _iter_valid_ticker_segments(
+            frame, seq_len, min_trades, target_horizon
+        ):
+            if idx_nw >= len(nw_list) or nw != nw_list[idx_nw]:
+                raise RuntimeError(
+                    "Streaming pass-2 desync at ticker block "
+                    f"(idx={idx_nw}, expected nw={nw_list[idx_nw] if idx_nw < len(nw_list) else 'eof'}, got {nw})"
+                )
+            write = _emit_ticker_windows(
+                prices[s:e],
+                sizes[s:e],
+                oflow[s:e],
+                times[s:e],
+                seq_len=seq_len,
+                min_trades=min_trades,
+                target_horizon=target_horizon,
+                target_type=target_type,
+                stride=stride,
+                X=X,
+                y=y,
+                ts_out=ts_out,
+                ticker_idx_out=ticker_idx_out,
+                write=write,
+                local_ticker_idx=local_ticker,
+            )
+            idx_nw += 1
+            local_ticker += 1
+
+    for chunk in iter_consolidated_trades_batches(consolidated_path, **iter_batch_kw):
+        df = _merge_remainder(remainder, chunk)
+        complete, remainder = _split_complete_remainder(df)
+        _flush_frame(complete)
+
+    _flush_frame(remainder)
+
+    if idx_nw != len(nw_list):
+        raise RuntimeError(
+            f"Streaming pass-2 ended early: processed {idx_nw} tickers, expected {len(nw_list)}"
+        )
+    if write != X.shape[0]:
+        raise RuntimeError(f"Streaming pass-2 write mismatch: {write} vs {X.shape[0]}")
+
+
+def build_sequences_from_consolidated(
+    consolidated_path: str | Path,
+    *,
+    seq_len: int = 32,
+    min_trades_per_market: int = 100,
+    target_type: Literal["next_price", "return_5", "direction_5"] = "next_price",
+    target_horizon: int = 1,
+    max_samples: Optional[int] = None,
+    iter_batch_kw: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex]:
+    """
+    Build sequences from a consolidated parquet without materialising all trades
+    in pandas at once (two streaming passes over DuckDB chunks).
+    """
+    path = Path(consolidated_path)
+    print("  Pass 1/2: counting windows (streaming consolidated parquet)...", flush=True)
+    nw_list = _collect_nw_list_streaming(
+        path, iter_batch_kw, seq_len, min_trades_per_market, target_horizon
+    )
+    total_w = sum(nw_list)
+    if total_w == 0:
+        return (
+            np.zeros((0, seq_len, _N_FEATURES), dtype=np.float32),
+            np.zeros(0, dtype=np.float32),
+            np.zeros(0, dtype=np.int64),
+            pd.DatetimeIndex([]),
+        )
+
+    stride = (
+        max(1, total_w // max_samples)
+        if max_samples is not None and total_w > max_samples
+        else 1
+    )
+    total_kept = sum((nw + stride - 1) // stride for nw in nw_list)
+    print(
+        f"  Pass 1 done: windows={total_w:,}, stride={stride}, samples_kept={total_kept:,}",
+        flush=True,
+    )
+
+    X = np.empty((total_kept, seq_len, _N_FEATURES), dtype=np.float32)
+    y = np.empty(total_kept, dtype=np.float32)
+    ts_out = np.empty(total_kept, dtype="datetime64[ns]")
+    ticker_idx_out = np.empty(total_kept, dtype=np.int64)
+
+    print("  Pass 2/2: filling X/y (streaming)...", flush=True)
+    _fill_streaming_pass2(
+        path,
+        iter_batch_kw,
+        nw_list,
+        stride,
+        seq_len,
+        min_trades_per_market,
+        target_horizon,
+        target_type,
+        X,
+        y,
+        ts_out,
+        ticker_idx_out,
+    )
+    gc.collect()
+    return X, y, ticker_idx_out, pd.DatetimeIndex(ts_out)
 
 
 def build_sequences(
