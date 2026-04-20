@@ -135,8 +135,7 @@ class LSTMModel:
 
             self._net.eval()
             with torch.no_grad():
-                val_pred = self._net(X_val_t)
-                val_loss = criterion(val_pred, y_val_t).item()
+                val_loss = self._batched_mse(X_val_t, y_val_t, criterion)
             scheduler.step(val_loss)
             if val_loss < self._best_loss:
                 self._best_loss = val_loss
@@ -152,10 +151,42 @@ class LSTMModel:
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._net is None:
             raise RuntimeError("Model not fitted")
+        X_t = torch.from_numpy(X.astype(np.float32, copy=False)).to(self.device)
         self._net.eval()
         with torch.no_grad():
-            out = self._net(torch.from_numpy(X.astype(np.float32, copy=False)).to(self.device))
+            out = self._batched_predict(X_t)
         return out.cpu().numpy().astype(np.float32)
+
+    def _batched_predict(self, X_t: torch.Tensor) -> torch.Tensor:
+        """Predict in batches to avoid huge one-shot CPU kernels."""
+        if self._net is None:
+            raise RuntimeError("Model not fitted")
+        preds: list[torch.Tensor] = []
+        n = X_t.size(0)
+        eval_bs = max(self.batch_size, 4096)
+        for start in range(0, n, eval_bs):
+            end = min(start + eval_bs, n)
+            preds.append(self._net(X_t[start:end]))
+        return torch.cat(preds, dim=0)
+
+    def _batched_mse(
+        self,
+        X_t: torch.Tensor,
+        y_t: torch.Tensor,
+        criterion: nn.Module,
+    ) -> float:
+        """Compute validation MSE in batches (memory and backend-safe)."""
+        if self._net is None:
+            raise RuntimeError("Model not fitted")
+        n = X_t.size(0)
+        eval_bs = max(self.batch_size, 4096)
+        total = 0.0
+        for start in range(0, n, eval_bs):
+            end = min(start + eval_bs, n)
+            pred = self._net(X_t[start:end])
+            loss = criterion(pred, y_t[start:end])
+            total += loss.item() * (end - start)
+        return total / n
 
     def get_state_dict(self) -> dict:
         if self._net is None:
