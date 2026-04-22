@@ -4,17 +4,16 @@ data:
   polymarket_trades: data/polymarket/trades
   polymarket_blocks: data/polymarket/blocks
   polymarket_markets: data/polymarket/markets
-  last_n_months: 12
+  last_n_months: 6
   exclude_sports: true
   polymarket_sports_tickers_file: data/polymarket/sports_tickers.txt
-  batch_by_month: false   # single DuckDB pass — faster than 13 repeated scans of 40k shards
-  # Uniform per-ticker stride is applied INSIDE build_sequences so peak RAM
-  # stays bounded to ~max_samples * seq_len * n_features * 4 bytes (float32).
-  # 10M samples -> X ~= 6.4 GB, comfortable on a 32 GB VM after accounting for
-  # the in-memory trades DataFrame (~5-8 GB) and training-time overhead.
-  max_samples: 10_000_000
-  # Uncomment after running scripts/prepare_data.py (cuts load time from hours to seconds):
-  # polymarket_consolidated: data/polymarket/consolidated/trades_with_timestamps.parquet
+  batch_by_month: false   # single DuckDB pass over the consolidated file
+  polymarket_consolidated: data/polymarket/consolidated/trades_with_timestamps.parquet
+  # Safety cap so the on-disk sequence store stays ≤ ~13 GB.
+  # With last_n_months=6 the raw window count is ~245 M; stride is applied only
+  # when it exceeds max_samples, so all markets and time periods stay represented.
+  # Remove this line (or set it to null) once you have verified disk space > 30 GB free.
+  max_samples: 20_000_000
 
 platform: polymarket
 
@@ -46,6 +45,9 @@ training:
   early_stopping_patience: 7
   device: cpu
   seed: 42
+  # X/y written to disk as numpy memmap: peak training RAM = O(batch_size), not O(n_samples).
+  # The folder is created inside output.dir.  Delete it to force a rebuild.
+  sequences_dir: sequences
 
 mlp:
   hidden: [128, 64, 32]
@@ -57,6 +59,6 @@ lstm:
   dropout: 0.2
 
 output:
-  dir: output/run_12m_singlepass
+  dir: output/run_6m
   save_models: true
   save_metrics: true

@@ -247,10 +247,20 @@ def build_sequences_from_consolidated(
     target_horizon: int = 1,
     max_samples: Optional[int] = None,
     iter_batch_kw: dict[str, Any],
+    memmap_dir: Optional[Path | str] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """
     Build sequences from a consolidated parquet without materialising all trades
     in pandas at once (two streaming passes over DuckDB chunks).
+
+    When ``memmap_dir`` is given the four output arrays (X, y, ts, ticker_idx)
+    are written to numpy memory-mapped files on disk instead of allocated in RAM.
+    This lets X be arbitrarily large — the OS pages only the slices currently
+    needed, so peak RSS stays O(batch_size) during training.
+
+    Resume behaviour: if ``memmap_dir`` already contains correctly-shaped files
+    from a previous run (same ``total_kept`` and same ``seq_len``/``_N_FEATURES``)
+    both streaming passes are skipped entirely.
     """
     path = Path(consolidated_path)
     print("  Pass 1/2: counting windows (streaming consolidated parquet)...", flush=True)
@@ -272,15 +282,64 @@ def build_sequences_from_consolidated(
         else 1
     )
     total_kept = sum((nw + stride - 1) // stride for nw in nw_list)
+    x_gb = total_kept * seq_len * _N_FEATURES * 4 / 1e9
     print(
-        f"  Pass 1 done: windows={total_w:,}, stride={stride}, samples_kept={total_kept:,}",
+        f"  Pass 1 done: windows={total_w:,}, stride={stride}, "
+        f"samples_kept={total_kept:,}  (X ≈ {x_gb:.1f} GB)",
         flush=True,
     )
 
-    X = np.empty((total_kept, seq_len, _N_FEATURES), dtype=np.float32)
-    y = np.empty(total_kept, dtype=np.float32)
-    ts_out = np.empty(total_kept, dtype="datetime64[ns]")
-    ticker_idx_out = np.empty(total_kept, dtype=np.int64)
+    if memmap_dir is not None:
+        mm_dir = Path(memmap_dir)
+        mm_dir.mkdir(parents=True, exist_ok=True)
+        x_path = mm_dir / "X.npy"
+        y_path = mm_dir / "y.npy"
+        ts_path = mm_dir / "ts.npy"
+        ti_path = mm_dir / "ticker_idx.npy"
+        meta_path = mm_dir / "meta.npy"
+
+        expected_shape = (total_kept, seq_len, _N_FEATURES)
+        can_resume = (
+            x_path.exists()
+            and y_path.exists()
+            and ts_path.exists()
+            and ti_path.exists()
+            and meta_path.exists()
+        )
+        if can_resume:
+            saved_meta = np.load(meta_path)
+            can_resume = tuple(int(v) for v in saved_meta) == expected_shape
+
+        if can_resume:
+            print(
+                f"  Sequences already on disk at {mm_dir} — skipping pass 2 (resume).",
+                flush=True,
+            )
+            # Open r+ so the caller can still apply in-place normalisation if needed.
+            X = np.memmap(x_path, mode="r+", dtype="float32", shape=expected_shape)
+            y = np.memmap(y_path, mode="r+", dtype="float32", shape=(total_kept,))
+            ts_out = np.memmap(ts_path, mode="r+", dtype="datetime64[ns]", shape=(total_kept,))
+            ticker_idx_out = np.memmap(ti_path, mode="r+", dtype="int64", shape=(total_kept,))
+            return X, y, ticker_idx_out, pd.DatetimeIndex(ts_out)
+
+        print(
+            f"  Writing {x_gb:.1f} GB sequence array to disk at {mm_dir} ...",
+            flush=True,
+        )
+        X = np.memmap(x_path, mode="w+", dtype="float32", shape=expected_shape)
+        y = np.memmap(y_path, mode="w+", dtype="float32", shape=(total_kept,))
+        ts_out = np.memmap(ts_path, mode="w+", dtype="datetime64[ns]", shape=(total_kept,))
+        ticker_idx_out = np.memmap(ti_path, mode="w+", dtype="int64", shape=(total_kept,))
+    else:
+        print(
+            f"  Allocating {x_gb:.1f} GB X array in RAM (set training.sequences_dir "
+            "to offload to disk).",
+            flush=True,
+        )
+        X = np.empty((total_kept, seq_len, _N_FEATURES), dtype=np.float32)
+        y = np.empty(total_kept, dtype=np.float32)
+        ts_out = np.empty(total_kept, dtype="datetime64[ns]")
+        ticker_idx_out = np.empty(total_kept, dtype=np.int64)
 
     print("  Pass 2/2: filling X/y (streaming)...", flush=True)
     _fill_streaming_pass2(
@@ -297,6 +356,21 @@ def build_sequences_from_consolidated(
         ts_out,
         ticker_idx_out,
     )
+
+    if memmap_dir is not None:
+        # Flush to disk and write shape metadata so future runs can resume.
+        X.flush()
+        y.flush()
+        ts_out.flush()
+        ticker_idx_out.flush()
+        np.save(meta_path, np.array(list(expected_shape), dtype=np.int64))
+        print(f"  Sequences flushed to {mm_dir}.", flush=True)
+        # Re-open as r+ so in-place normalisation in the caller can write back to disk.
+        X = np.memmap(x_path, mode="r+", dtype="float32", shape=expected_shape)
+        y = np.memmap(y_path, mode="r+", dtype="float32", shape=(total_kept,))
+        ts_out = np.memmap(ts_path, mode="r+", dtype="datetime64[ns]", shape=(total_kept,))
+        ticker_idx_out = np.memmap(ti_path, mode="r+", dtype="int64", shape=(total_kept,))
+
     gc.collect()
     return X, y, ticker_idx_out, pd.DatetimeIndex(ts_out)
 

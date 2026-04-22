@@ -39,7 +39,12 @@ class _LSTMNet(nn.Module):
 
 class LSTMModel:
     """
-    LSTM over (seq_len, n_features) -> scalar. Fit accepts optional X_val/y_val for early stopping.
+    LSTM over (seq_len, n_features) -> scalar.
+    Fit accepts optional X_val/y_val for early stopping.
+
+    Training never materialises the full dataset as a single PyTorch tensor.
+    Each mini-batch is loaded from numpy (or memmap) arrays on demand so
+    peak RSS is O(batch_size), not O(n_samples).
     """
 
     def __init__(
@@ -72,6 +77,26 @@ class LSTMModel:
         self._patience_counter = 0
         self._rng = np.random.default_rng(seed)
 
+    # ------------------------------------------------------------------
+    # Internal helpers: load a contiguous batch from numpy/memmap arrays.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_batch(X: np.ndarray, y: np.ndarray, idx: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fancy-index rows at idx; returns (X_batch, y_batch) as float32 tensors."""
+        bx = np.ascontiguousarray(X[idx], dtype=np.float32)
+        by = np.ascontiguousarray(y[idx], dtype=np.float32)
+        return torch.from_numpy(bx), torch.from_numpy(by)
+
+    @staticmethod
+    def _load_slice(X: np.ndarray, y: np.ndarray, s: int, e: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Contiguous slice [s:e] → (X_batch, y_batch) float32 tensors."""
+        bx = np.ascontiguousarray(X[s:e], dtype=np.float32)
+        by = np.ascontiguousarray(y[s:e], dtype=np.float32)
+        return torch.from_numpy(bx), torch.from_numpy(by)
+
+    # ------------------------------------------------------------------
+
     def fit(
         self,
         X: np.ndarray,
@@ -79,23 +104,19 @@ class LSTMModel:
         X_val: np.ndarray | None = None,
         y_val: np.ndarray | None = None,
     ) -> None:
-        # copy=False avoids a redundant allocation when arrays are already float32.
-        X_t = torch.from_numpy(X.astype(np.float32, copy=False)).to(self.device)
-        y_t = torch.from_numpy(y.astype(np.float32, copy=False)).to(self.device)
-
-        if X_val is not None and y_val is not None:
-            X_val_t = torch.from_numpy(X_val.astype(np.float32, copy=False)).to(self.device)
-            y_val_t = torch.from_numpy(y_val.astype(np.float32, copy=False)).to(self.device)
-        else:
-            n = X_t.size(0)
+        """
+        X, y: (n, seq_len, n_features), (n,). May be numpy.memmap.
+        If X_val/y_val provided use for early stopping; otherwise reserve last 20%.
+        """
+        if X_val is None or y_val is None:
+            n = len(X)
             val_size = max(1024, n // 5)
-            perm = self._rng.permutation(n)
-            X_t = X_t[perm]
-            y_t = y_t[perm]
-            X_val_t = X_t[-val_size:]
-            y_val_t = y_t[-val_size:]
-            X_t = X_t[:-val_size]
-            y_t = y_t[:-val_size]
+            X_val = X[n - val_size:]
+            y_val = y[n - val_size:]
+            X = X[: n - val_size]
+            y = y[: n - val_size]
+
+        n_train = len(X)
 
         torch.manual_seed(self.seed)
         self._net = _LSTMNet(
@@ -116,26 +137,25 @@ class LSTMModel:
 
         for epoch in range(self.max_epochs):
             self._net.train()
-            # Shuffle only the indices, not the data.  Materialising a full
-            # permuted copy of X_t (X_t[perm]) can consume several GB on large
-            # datasets and is the primary training-loop OOM trigger.
-            perm = self._rng.permutation(X_t.size(0))
+            perm = self._rng.permutation(n_train)
             epoch_loss = 0.0
-            for start in range(0, X_t.size(0), self.batch_size):
-                end = min(start + self.batch_size, X_t.size(0))
-                batch_idx = perm[start:end]
-                pred = self._net(X_t[batch_idx])
-                loss = criterion(pred, y_t[batch_idx])
+            for start in range(0, n_train, self.batch_size):
+                batch_idx = perm[start : start + self.batch_size]
+                bx_t, by_t = self._load_batch(X, y, batch_idx)
+                bx_t = bx_t.to(self.device)
+                by_t = by_t.to(self.device)
+                pred = self._net(bx_t)
+                loss = criterion(pred, by_t)
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._net.parameters(), 1.0)
                 opt.step()
-                epoch_loss += loss.item() * (end - start)
-            epoch_loss /= X_t.size(0)
+                epoch_loss += loss.item() * len(batch_idx)
+            epoch_loss /= n_train
 
             self._net.eval()
             with torch.no_grad():
-                val_loss = self._batched_mse(X_val_t, y_val_t, criterion)
+                val_loss = self._batched_mse(X_val, y_val, criterion)
             scheduler.step(val_loss)
             if val_loss < self._best_loss:
                 self._best_loss = val_loss
@@ -145,47 +165,43 @@ class LSTMModel:
                 self._patience_counter += 1
             if self._patience_counter >= self.patience:
                 break
+
         if best_state is not None:
             self._net.load_state_dict(best_state)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._net is None:
             raise RuntimeError("Model not fitted")
-        X_t = torch.from_numpy(X.astype(np.float32, copy=False)).to(self.device)
         self._net.eval()
-        with torch.no_grad():
-            out = self._batched_predict(X_t)
-        return out.cpu().numpy().astype(np.float32)
-
-    def _batched_predict(self, X_t: torch.Tensor) -> torch.Tensor:
-        """Predict in batches to avoid huge one-shot CPU kernels."""
-        if self._net is None:
-            raise RuntimeError("Model not fitted")
-        preds: list[torch.Tensor] = []
-        n = X_t.size(0)
+        preds: list[np.ndarray] = []
         eval_bs = max(self.batch_size, 4096)
-        for start in range(0, n, eval_bs):
-            end = min(start + eval_bs, n)
-            preds.append(self._net(X_t[start:end]))
-        return torch.cat(preds, dim=0)
+        with torch.no_grad():
+            for s in range(0, len(X), eval_bs):
+                e = min(s + eval_bs, len(X))
+                bx_t = torch.from_numpy(
+                    np.ascontiguousarray(X[s:e], dtype=np.float32)
+                ).to(self.device)
+                preds.append(self._net(bx_t).cpu().numpy())
+        return np.concatenate(preds, axis=0).astype(np.float32)
 
     def _batched_mse(
         self,
-        X_t: torch.Tensor,
-        y_t: torch.Tensor,
+        X: np.ndarray,
+        y: np.ndarray,
         criterion: nn.Module,
     ) -> float:
-        """Compute validation MSE in batches (memory and backend-safe)."""
+        """Compute validation MSE in batches without loading the full set into a tensor."""
         if self._net is None:
             raise RuntimeError("Model not fitted")
-        n = X_t.size(0)
+        n = len(X)
         eval_bs = max(self.batch_size, 4096)
         total = 0.0
-        for start in range(0, n, eval_bs):
-            end = min(start + eval_bs, n)
-            pred = self._net(X_t[start:end])
-            loss = criterion(pred, y_t[start:end])
-            total += loss.item() * (end - start)
+        for s in range(0, n, eval_bs):
+            e = min(s + eval_bs, n)
+            bx_t, by_t = self._load_slice(X, y, s, e)
+            bx_t = bx_t.to(self.device)
+            by_t = by_t.to(self.device)
+            total += criterion(self._net(bx_t), by_t).item() * (e - s)
         return total / n
 
     def get_state_dict(self) -> dict:

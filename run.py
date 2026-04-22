@@ -104,6 +104,13 @@ def main() -> None:
     target_horizon = target_cfg.get("horizon", 1)
     max_samples = data_cfg.get("max_samples")
 
+    # Optional disk-backed sequence store: X/y written as numpy memmap so they
+    # never reside in RAM as a monolithic allocation.  Peak RSS during training
+    # stays O(batch_size) regardless of dataset size.
+    train_cfg_early = cfg.get("training", {})
+    sequences_dir_rel = train_cfg_early.get("sequences_dir")
+    memmap_dir: Path | None = (out_dir / sequences_dir_rel) if sequences_dir_rel else None
+
     consolidated_exists = consolidated_path is not None and consolidated_path.exists()
     trades = None
 
@@ -175,6 +182,7 @@ def main() -> None:
             target_horizon=target_horizon,
             max_samples=max_samples,
             iter_batch_kw=iter_kw,
+            memmap_dir=memmap_dir,
         )
     else:
         X, y, _, timestamps = build_sequences(
@@ -224,13 +232,32 @@ def main() -> None:
     normalize = cfg.get("normalize_features", True)
     if normalize:
         scaler = SequenceScaler()
-        # In-place normalization writes back into X (which X_train/val/test view).
-        # Avoids allocating two full-size temporaries from (X - mean) / std.
-        scaler.fit(X_train)
-        scaler.transform(X_train, inplace=True)
-        scaler.transform(X_val, inplace=True)
-        scaler.transform(X_test, inplace=True)
-        print("  features normalized (mean/std on train, in-place)")
+        if memmap_dir is not None:
+            # Avoid double-normalising across runs: write a flag file after the
+            # first normalisation so resuming runs skip it and just reload stats.
+            norm_flag = memmap_dir / "normalized.flag"
+            scaler_cache = memmap_dir / "scaler.npz"
+            if norm_flag.exists() and scaler_cache.exists():
+                data = np.load(scaler_cache)
+                scaler._mean = data["mean"]
+                scaler._std = data["std"]
+                print("  features normalised (loaded cached scaler — memmap already scaled)")
+            else:
+                # In-place: writes directly into the memmap files on disk.
+                # Reads all of X_train once to compute mean/std (O(1) peak RAM).
+                scaler.fit(X_train)
+                scaler.transform(X_train, inplace=True)
+                scaler.transform(X_val, inplace=True)
+                scaler.transform(X_test, inplace=True)
+                np.savez(scaler_cache, mean=scaler._mean, std=scaler._std)
+                norm_flag.touch()
+                print("  features normalised in-place on disk (scaler cached)")
+        else:
+            scaler.fit(X_train)
+            scaler.transform(X_train, inplace=True)
+            scaler.transform(X_val, inplace=True)
+            scaler.transform(X_test, inplace=True)
+            print("  features normalized (mean/std on train, in-place)")
 
     last_price_test = X_test[:, -1, 0]
 

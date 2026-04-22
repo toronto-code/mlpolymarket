@@ -11,6 +11,10 @@ class MLPModel:
     """
     MLP: (seq_len * n_features) -> 1. Optional BatchNorm and dropout.
     Fit accepts optional validation set for early stopping; otherwise splits from train.
+
+    Training never materialises the full dataset as a single PyTorch tensor.
+    Each mini-batch is loaded from the numpy (or memmap) arrays on demand, so
+    peak RSS during training is O(batch_size), not O(n_samples).
     """
 
     def __init__(
@@ -45,7 +49,7 @@ class MLPModel:
     def _build_net(self) -> nn.Module:
         layers = []
         d = self.input_dim
-        for i, h in enumerate(self.hidden):
+        for h in self.hidden:
             layers.append(nn.Linear(d, h))
             layers.append(nn.LayerNorm(h))
             layers.append(nn.ReLU(inplace=True))
@@ -53,6 +57,36 @@ class MLPModel:
             d = h
         layers.append(nn.Linear(d, 1))
         return nn.Sequential(*layers)
+
+    # ------------------------------------------------------------------
+    # Internal helpers: load a contiguous batch from a numpy/memmap array.
+    # For memmap X the OS pages in only the requested rows; for a regular
+    # in-RAM array the copy is a few hundred KB — negligible either way.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_batch_x(X: np.ndarray, idx: np.ndarray) -> torch.Tensor:
+        """Fancy-index X at idx and return a float32 CPU tensor (flat)."""
+        n = len(idx)
+        # ascontiguousarray forces a real copy (not a view) so torch can own it.
+        batch = np.ascontiguousarray(X[idx].reshape(n, -1), dtype=np.float32)
+        return torch.from_numpy(batch)
+
+    @staticmethod
+    def _load_slice_x(X: np.ndarray, s: int, e: int) -> torch.Tensor:
+        """Contiguous slice [s:e] of X → flat float32 tensor."""
+        batch = np.ascontiguousarray(X[s:e].reshape(e - s, -1), dtype=np.float32)
+        return torch.from_numpy(batch)
+
+    @staticmethod
+    def _load_batch_y(y: np.ndarray, idx: np.ndarray) -> torch.Tensor:
+        return torch.from_numpy(np.ascontiguousarray(y[idx], dtype=np.float32)).unsqueeze(1)
+
+    @staticmethod
+    def _load_slice_y(y: np.ndarray, s: int, e: int) -> torch.Tensor:
+        return torch.from_numpy(np.ascontiguousarray(y[s:e], dtype=np.float32)).unsqueeze(1)
+
+    # ------------------------------------------------------------------
 
     def fit(
         self,
@@ -62,28 +96,19 @@ class MLPModel:
         y_val: np.ndarray | None = None,
     ) -> None:
         """
-        X, y: (n, seq_len, n_features), (n,). If X_val/y_val provided, use for early stopping.
-        Otherwise reserve 20% of X,y as validation.
+        X, y: (n, seq_len, n_features), (n,). May be numpy.memmap.
+        If X_val/y_val provided, use for early stopping; otherwise reserve last 20%.
         """
-        # copy=False avoids a redundant allocation when X is already float32.
-        X_flat = X.reshape(X.shape[0], -1).astype(np.float32, copy=False)
-        X_t = torch.from_numpy(X_flat).to(self.device)
-        y_t = torch.from_numpy(y.astype(np.float32, copy=False)).unsqueeze(1).to(self.device)
-
-        if X_val is not None and y_val is not None:
-            X_val_flat = X_val.reshape(X_val.shape[0], -1).astype(np.float32, copy=False)
-            X_val_t = torch.from_numpy(X_val_flat).to(self.device)
-            y_val_t = torch.from_numpy(y_val.astype(np.float32, copy=False)).unsqueeze(1).to(self.device)
-        else:
-            n = X_t.size(0)
+        if X_val is None or y_val is None:
+            n = len(X)
             val_size = max(1024, n // 5)
-            perm = self._rng.permutation(n)
-            X_t = X_t[perm]
-            y_t = y_t[perm]
-            X_val_t = X_t[-val_size:]
-            y_val_t = y_t[-val_size:]
-            X_t = X_t[:-val_size]
-            y_t = y_t[:-val_size]
+            # Use the chronologically last slice as validation (preserves time order).
+            X_val = X[n - val_size:]
+            y_val = y[n - val_size:]
+            X = X[: n - val_size]
+            y = y[: n - val_size]
+
+        n_train = len(X)
 
         torch.manual_seed(self.seed)
         self._net = self._build_net().to(self.device)
@@ -99,26 +124,24 @@ class MLPModel:
 
         for epoch in range(self.max_epochs):
             self._net.train()
-            # Shuffle only the indices, not the data.  Materialising a full
-            # permuted copy of X_t (X_t[perm]) can consume several GB on large
-            # datasets and is the primary training-loop OOM trigger.
-            perm = self._rng.permutation(X_t.size(0))
+            perm = self._rng.permutation(n_train)
             epoch_loss = 0.0
-            for start in range(0, X_t.size(0), self.batch_size):
-                end = min(start + self.batch_size, X_t.size(0))
-                batch_idx = perm[start:end]
-                pred = self._net(X_t[batch_idx])
-                loss = criterion(pred, y_t[batch_idx])
+            for start in range(0, n_train, self.batch_size):
+                batch_idx = perm[start : start + self.batch_size]
+                bx_t = self._load_batch_x(X, batch_idx).to(self.device)
+                by_t = self._load_batch_y(y, batch_idx).to(self.device)
+                pred = self._net(bx_t)
+                loss = criterion(pred, by_t)
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._net.parameters(), 1.0)
                 opt.step()
-                epoch_loss += loss.item() * (end - start)
-            epoch_loss /= X_t.size(0)
+                epoch_loss += loss.item() * len(batch_idx)
+            epoch_loss /= n_train
 
             self._net.eval()
             with torch.no_grad():
-                val_loss = self._batched_mse(X_val_t, y_val_t, criterion)
+                val_loss = self._batched_mse(X_val, y_val, criterion)
             scheduler.step(val_loss)
             if val_loss < self._best_loss:
                 self._best_loss = val_loss
@@ -128,46 +151,41 @@ class MLPModel:
                 self._patience_counter += 1
             if self._patience_counter >= self.patience:
                 break
+
         if best_state is not None:
             self._net.load_state_dict(best_state)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         if self._net is None:
             raise RuntimeError("Model not fitted")
-        X_flat = X.reshape(X.shape[0], -1).astype(np.float32, copy=False)
-        X_t = torch.from_numpy(X_flat).to(self.device)
         self._net.eval()
-        with torch.no_grad():
-            out = self._batched_predict(X_t)
-        return out.cpu().numpy().squeeze(1).astype(np.float32)
-
-    def _batched_predict(self, X_t: torch.Tensor) -> torch.Tensor:
-        if self._net is None:
-            raise RuntimeError("Model not fitted")
-        preds: list[torch.Tensor] = []
-        n = X_t.size(0)
+        preds: list[np.ndarray] = []
         eval_bs = max(self.batch_size, 8192)
-        for start in range(0, n, eval_bs):
-            end = min(start + eval_bs, n)
-            preds.append(self._net(X_t[start:end]))
-        return torch.cat(preds, dim=0)
+        with torch.no_grad():
+            for s in range(0, len(X), eval_bs):
+                e = min(s + eval_bs, len(X))
+                bx_t = self._load_slice_x(X, s, e).to(self.device)
+                out = self._net(bx_t).cpu().numpy()
+                preds.append(out)
+        return np.concatenate(preds, axis=0).squeeze(1).astype(np.float32)
 
     def _batched_mse(
         self,
-        X_t: torch.Tensor,
-        y_t: torch.Tensor,
+        X: np.ndarray,
+        y: np.ndarray,
         criterion: nn.Module,
     ) -> float:
+        """Compute validation MSE without loading the full set into a single tensor."""
         if self._net is None:
             raise RuntimeError("Model not fitted")
-        n = X_t.size(0)
+        n = len(X)
         eval_bs = max(self.batch_size, 8192)
         total = 0.0
-        for start in range(0, n, eval_bs):
-            end = min(start + eval_bs, n)
-            pred = self._net(X_t[start:end])
-            loss = criterion(pred, y_t[start:end])
-            total += loss.item() * (end - start)
+        for s in range(0, n, eval_bs):
+            e = min(s + eval_bs, n)
+            bx_t = self._load_slice_x(X, s, e).to(self.device)
+            by_t = self._load_slice_y(y, s, e).to(self.device)
+            total += criterion(self._net(bx_t), by_t).item() * (e - s)
         return total / n
 
     def get_state_dict(self) -> dict:
