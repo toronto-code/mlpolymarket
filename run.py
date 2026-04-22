@@ -230,17 +230,22 @@ def main() -> None:
     y_test = y[t2:]
 
     normalize = cfg.get("normalize_features", True)
+    # Gate memmap normalisation path on X actually being a memmap, not just on the
+    # config key.  If the consolidated parquet was absent and we fell back to
+    # build_sequences(), X is a plain numpy array even if sequences_dir was set —
+    # in that case the memmap_dir was never created and writing flag/cache would crash.
+    x_is_memmap = isinstance(X, np.memmap)
     if normalize:
         scaler = SequenceScaler()
-        if memmap_dir is not None:
+        if x_is_memmap and memmap_dir is not None:
             # Avoid double-normalising across runs: write a flag file after the
             # first normalisation so resuming runs skip it and just reload stats.
             norm_flag = memmap_dir / "normalized.flag"
             scaler_cache = memmap_dir / "scaler.npz"
             if norm_flag.exists() and scaler_cache.exists():
-                data = np.load(scaler_cache)
-                scaler._mean = data["mean"]
-                scaler._std = data["std"]
+                cached = np.load(scaler_cache)
+                scaler._mean = cached["mean"]
+                scaler._std = cached["std"]
                 print("  features normalised (loaded cached scaler — memmap already scaled)")
             else:
                 # In-place: writes directly into the memmap files on disk.
