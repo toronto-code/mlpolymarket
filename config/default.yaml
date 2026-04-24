@@ -6,6 +6,9 @@ data:
   polymarket_trades: "data/polymarket/trades"
   polymarket_blocks: "data/polymarket/blocks"
   polymarket_markets: "data/polymarket/markets"
+  # Pre-joined trades+timestamps (built once by scripts/prepare_data.py). When the file exists,
+  # training loads from this single parquet instead of scanning tens of thousands of shards.
+  polymarket_consolidated: "data/polymarket/consolidated/trades_with_timestamps.parquet"
   last_n_months: 12
   exclude_sports: true
   polymarket_sports_tickers_file: "data/polymarket/sports_tickers.txt"
