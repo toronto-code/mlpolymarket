@@ -53,6 +53,13 @@ def main() -> None:
     minimize = sweep_cfg.get("minimize", True)
     selection_model = sweep_cfg.get("selection_model", "lstm")
 
+    # Apply sweep-level config overrides (e.g. data.max_samples, training.sequences_dir)
+    # BEFORE per-run overrides. These keys are sweep metadata, not training config.
+    sweep_meta_keys = {"base_config", "output_root", "runs", "metric", "minimize", "selection_model"}
+    sweep_overrides = {k: v for k, v in sweep_cfg.items() if k not in sweep_meta_keys}
+    if sweep_overrides:
+        base = deep_merge(base, sweep_overrides)
+
     if not runs:
         print("No runs in sweep config.")
         return

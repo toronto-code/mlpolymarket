@@ -23,6 +23,10 @@ from .load import iter_consolidated_trades_batches
 _FEATURE_COLS = ["yes_price", "size", "order_flow", "vwap", "price_std_5"]
 _N_FEATURES = len(_FEATURE_COLS)
 
+# Maximum safe RAM allocation (GB) for sequence arrays before requiring memmap.
+# Exceeding this without training.sequences_dir set will raise an error.
+_MAX_RAM_GB = 24.0
+
 
 def _per_ticker_stats(prices: np.ndarray, sizes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Causal VWAP (shifted by 1) and 5-trade rolling std of price, both float32."""
@@ -352,6 +356,12 @@ def build_sequences_from_consolidated(
         ticker_idx_out = np.memmap(ti_path, mode="w+", dtype="int64", shape=(total_kept,))
     else:
         expected_shape = (total_kept, seq_len, _N_FEATURES)
+        if x_gb > _MAX_RAM_GB:
+            raise MemoryError(
+                f"Sequence array would require {x_gb:.1f} GB RAM (limit: {_MAX_RAM_GB} GB). "
+                f"Set training.sequences_dir in your config to offload to disk, "
+                f"or set data.max_samples to cap the dataset size."
+            )
         print(
             f"  Allocating {x_gb:.1f} GB X array in RAM (set training.sequences_dir "
             "to offload to disk).",
@@ -403,6 +413,7 @@ def build_sequences(
     target_type: Literal["next_price", "return_5", "direction_5"] = "next_price",
     target_horizon: int = 1,
     max_samples: Optional[int] = None,
+    memmap_dir: Optional[Path] = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, pd.DatetimeIndex]:
     """
     For each trade (after seq_len), build:
@@ -501,10 +512,43 @@ def build_sequences(
         total_kept += kept
 
     # Pre-allocate the single final output once. No list-of-arrays, no concatenate.
-    X = np.empty((total_kept, seq_len, _N_FEATURES), dtype=np.float32)
-    y = np.empty(total_kept, dtype=np.float32)
-    ts_out = np.empty(total_kept, dtype="datetime64[ns]")
-    ticker_idx_out = np.empty(total_kept, dtype=np.int64)
+    # When memmap_dir is set, write to disk to avoid RAM blowup on large datasets.
+    expected_shape = (total_kept, seq_len, _N_FEATURES)
+    x_gb = total_kept * seq_len * _N_FEATURES * 4 / 1e9
+
+    if memmap_dir is not None:
+        mm_dir = Path(memmap_dir)
+        mm_dir.mkdir(parents=True, exist_ok=True)
+        x_path = mm_dir / "X.npy"
+        y_path = mm_dir / "y.npy"
+        ts_path = mm_dir / "ts.npy"
+        ti_path = mm_dir / "ticker_idx.npy"
+        meta_path = mm_dir / "meta.npy"
+
+        print(
+            f"  Writing {x_gb:.1f} GB sequence array to disk at {mm_dir} ...",
+            flush=True,
+        )
+        X = np.memmap(x_path, mode="w+", dtype="float32", shape=expected_shape)
+        y = np.memmap(y_path, mode="w+", dtype="float32", shape=(total_kept,))
+        ts_out = np.memmap(ts_path, mode="w+", dtype="datetime64[ns]", shape=(total_kept,))
+        ticker_idx_out = np.memmap(ti_path, mode="w+", dtype="int64", shape=(total_kept,))
+    else:
+        if x_gb > _MAX_RAM_GB:
+            raise MemoryError(
+                f"Sequence array would require {x_gb:.1f} GB RAM (limit: {_MAX_RAM_GB} GB). "
+                f"Set training.sequences_dir in your config to offload to disk, "
+                f"or set data.max_samples to cap the dataset size."
+            )
+        print(
+            f"  Allocating {x_gb:.1f} GB X array in RAM (set training.sequences_dir "
+            "to offload to disk).",
+            flush=True,
+        )
+        X = np.empty(expected_shape, dtype=np.float32)
+        y = np.empty(total_kept, dtype=np.float32)
+        ts_out = np.empty(total_kept, dtype="datetime64[ns]")
+        ticker_idx_out = np.empty(total_kept, dtype=np.int64)
 
     # Record which ticker names survive so we can emit a compact index -> name mapping.
     kept_ticker_names: list = []
@@ -575,6 +619,26 @@ def build_sequences(
     # Free the original long per-trade arrays before returning.
     del prices, sizes, order_flow, times, tickers_col
     gc.collect()
+
+    # Flush memmap to disk and save metadata for resume support.
+    if memmap_dir is not None:
+        mm_dir = Path(memmap_dir)
+        X.flush()
+        y.flush()
+        ts_out.flush()
+        ticker_idx_out.flush()
+        meta_path = mm_dir / "meta.npy"
+        np.save(meta_path, np.array(list(expected_shape), dtype=np.int64))
+        print(f"  Sequences flushed to {mm_dir}.", flush=True)
+        # Re-open as r+ so in-place normalisation can write back to disk.
+        x_path = mm_dir / "X.npy"
+        y_path = mm_dir / "y.npy"
+        ts_path = mm_dir / "ts.npy"
+        ti_path = mm_dir / "ticker_idx.npy"
+        X = np.memmap(x_path, mode="r+", dtype="float32", shape=expected_shape)
+        y = np.memmap(y_path, mode="r+", dtype="float32", shape=(total_kept,))
+        ts_out = np.memmap(ts_path, mode="r+", dtype="datetime64[ns]", shape=(total_kept,))
+        ticker_idx_out = np.memmap(ti_path, mode="r+", dtype="int64", shape=(total_kept,))
 
     return X, y, ticker_idx_out, pd.DatetimeIndex(ts_out)
 

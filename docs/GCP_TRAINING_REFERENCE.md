@@ -4,13 +4,15 @@ Quick reference for running the mlpolymarket pipeline on Google Cloud. Source: C
 
 ---
 
-## VM specs (from that chat)
+## VM specs (updated baseline)
 
 - **Region:** northamerica-northeast2 (Toronto)
-- **Zone:** northamerica-northeast2-a (or -b, -c; if “Any” fails, try a specific zone or us-central1)
-- **Machine type:** e2-standard-4 (4 vCPU, 16 GB RAM)
-- **Boot disk:** 150 GB, Ubuntu 22.04 LTS
-- **Example VM name from chat:** `instance-20260222-194709`
+- **Zone:** northamerica-northeast2-b (or another zone where your instance exists)
+- **Machine type:** use enough RAM for your run mode
+  - 32 GB RAM VM works with consolidated streaming + safer sweep settings
+  - Full-data no-cap sweeps may require significantly more RAM
+- **Boot disk:** 150 GB minimum (more if keeping large outputs)
+- **Example VM names from recent runs:** `instance-20260428-034135`, `instance-20260415-144541`
 
 Replace `YOUR_VM_NAME`, `YOUR_ZONE`, `YOUR_PROJECT_ID` below with your actual values.
 
@@ -32,7 +34,7 @@ Or in Console: **Compute Engine → VM instances → SSH**.
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git zstd aria2 python3-pip python3-venv
+sudo apt-get install -y git zstd aria2 python3-pip python3-venv screen ripgrep
 ```
 
 ---
@@ -48,6 +50,16 @@ bash scripts/download.sh
 
 - Runs on the VM; data stays on the VM.
 - Ignore `LIBARCHIVE.xattr.com.apple.provenance` messages; extraction is fine.
+- If you see `aria2c not found, falling back to curl`, install `aria2` first for faster download.
+
+Sanity check before any training:
+
+```bash
+ls ~/prediction-market-analysis/data/polymarket/trades | head
+ls ~/prediction-market-analysis/data/polymarket/blocks | head
+```
+
+If either path is missing, stop and fix data setup before running `run.py`/`sweep.py`.
 
 ---
 
@@ -70,6 +82,29 @@ pip install numpy pandas pyarrow duckdb scikit-learn torch pyyaml tqdm
 ```
 
 If you get `ModuleNotFoundError: No module named 'src.data'`, ensure `run.py` adds the project root to `sys.path` (see repo history / “Fix: add project root to path for src imports”).
+
+---
+
+## 5b. Build consolidated parquet once (recommended)
+
+This avoids repeated expensive raw-shard joins and is the most reliable path for large sweeps.
+
+```bash
+cd ~/mlpolymarket
+source .venv/bin/activate
+python scripts/prepare_data.py \
+  --data-dir ~/prediction-market-analysis \
+  --months 12 \
+  --memory-limit 24GB \
+  --threads 8 \
+  --resume
+```
+
+Confirm output:
+
+```bash
+ls -lh ~/prediction-market-analysis/data/polymarket/consolidated/trades_with_timestamps.parquet
+```
 
 ---
 
@@ -136,6 +171,66 @@ DATA_DIR=~/prediction-market-analysis ./scripts/run_background.sh sweep
 ```
 
 Then watch logs: `tail -f output/logs/sweep_*.log`. To see if still running: `pgrep -af sweep.py`.
+
+---
+
+## 6c. Preflight checks that prevent wasted runs
+
+### Smoke test (must produce metrics)
+
+```bash
+cat > /tmp/smoke.yaml <<'YAML'
+seed: 42
+data:
+  polymarket_consolidated: data/polymarket/consolidated/trades_with_timestamps.parquet
+  last_n_months: 1
+  max_rows: 200000
+sequence:
+  min_trades_per_market: 20
+training:
+  epochs: 1
+  early_stopping_patience: 1
+models:
+  baseline_last_price: true
+  baseline_vwap: true
+  mlp: false
+  lstm: false
+output:
+  save_models: false
+  save_metrics: true
+YAML
+
+python run.py --config /tmp/smoke.yaml --data-dir ~/prediction-market-analysis --output-dir /tmp/metrics_smoke
+ls -lh /tmp/metrics_smoke/metrics.json
+```
+
+If `metrics.json` exists, recording is healthy.
+
+### Early sentinel check (first 2-5 min of sweep)
+
+```bash
+LOG=$(ls -t output/logs/sweep_*.log | head -n 1)
+tail -n 120 "$LOG"
+grep -nE "Consolidated parquet found|Wrote .*metrics.json|not found|Point --data-dir|Traceback|ERROR" "$LOG"
+```
+
+You want:
+
+- `Consolidated parquet found`
+- later `Wrote .../metrics.json`
+
+You do not want:
+
+- `trades directory not found`
+- `Point --data-dir ...`
+- `Traceback`
+
+### 32GB RAM safety note
+
+If logs show huge memory estimates (for example `X ~= 179 GB`), stop and rerun with safer config:
+
+- enable disk-backed sequences (`training.sequences_dir`), and/or
+- set `data.max_samples` for sweeps.
 
 ---
 

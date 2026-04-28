@@ -192,6 +192,7 @@ def main() -> None:
             target_type=target_type,
             target_horizon=target_horizon,
             max_samples=max_samples,
+            memmap_dir=memmap_dir,
         )
         del trades
     gc.collect()

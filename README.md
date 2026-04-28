@@ -21,6 +21,14 @@ uv sync
 
 (Or `pip install -e .` with the project’s dependencies.)
 
+For a plain venv setup:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install numpy pandas pyarrow duckdb scikit-learn torch pyyaml tqdm
+```
+
 ## Data
 
 - **Real data (recommended)**: In the [prediction-market-analysis](https://github.com/Jon-Becker/prediction-market-analysis) repo run `make setup`, then point this repo at it with `--data-dir`.
@@ -32,6 +40,38 @@ uv sync
     python scripts/generate_sports_tickers.py --data-dir /path/to/prediction-market-analysis
     ```
     The script uses your markets Parquet (question/slug) to detect sports and the Polymarket Gamma API to resolve token IDs.
+
+### Path sanity check (before every long run)
+
+Always verify expected data paths exist on the VM:
+
+```bash
+ls ~/prediction-market-analysis/data/polymarket/trades | head
+ls ~/prediction-market-analysis/data/polymarket/blocks | head
+```
+
+If either path is missing, do not start training.
+
+### Consolidated parquet (recommended for reliability and speed)
+
+Build a pre-joined consolidated parquet once (per VM/dataset copy):
+
+```bash
+python scripts/prepare_data.py \
+  --data-dir ~/prediction-market-analysis \
+  --months 12 \
+  --memory-limit 24GB \
+  --threads 8 \
+  --resume
+```
+
+Then verify:
+
+```bash
+ls -lh ~/prediction-market-analysis/data/polymarket/consolidated/trades_with_timestamps.parquet
+```
+
+With `data.polymarket_consolidated` set in config, `run.py` uses the streaming consolidated loader and avoids repeated raw-shard joins.
 
 ## Single run
 
@@ -60,6 +100,61 @@ python sweep.py --config config/sweep.yaml --data-dir /path/to/data
 - Full results: `output/sweep/sweep_summary.json` and per-run dirs.
 
 Edit `config/sweep.yaml` to add or change runs (e.g. different `sequence.length`, `lstm.hidden`, `training.lr`).
+
+### Detached sweep launch (safe for laptop close / SSH drops)
+
+```bash
+cd ~/mlpolymarket
+DATA_DIR=~/prediction-market-analysis ./scripts/run_background.sh sweep
+```
+
+Check status:
+
+```bash
+pgrep -af "python.*sweep.py|python.*run.py"
+tail -n 120 "$(ls -t output/logs/sweep_*.log | head -n 1)"
+```
+
+### Smoke test before expensive sweeps
+
+This verifies metrics writing end-to-end.
+
+```bash
+cat > /tmp/smoke.yaml <<'YAML'
+seed: 42
+data:
+  polymarket_consolidated: data/polymarket/consolidated/trades_with_timestamps.parquet
+  last_n_months: 1
+  max_rows: 200000
+sequence:
+  min_trades_per_market: 20
+training:
+  epochs: 1
+  early_stopping_patience: 1
+models:
+  baseline_last_price: true
+  baseline_vwap: true
+  mlp: false
+  lstm: false
+output:
+  save_models: false
+  save_metrics: true
+YAML
+
+python run.py --config /tmp/smoke.yaml --data-dir ~/prediction-market-analysis --output-dir /tmp/metrics_smoke
+ls -lh /tmp/metrics_smoke/metrics.json
+```
+
+If `metrics.json` exists, recording pipeline is healthy.
+
+### 32GB RAM note
+
+On 32GB VMs, a no-cap 12-month run can attempt very large in-RAM arrays. For reliability:
+
+- Set `training.sequences_dir` (disk-backed sequence store), and/or
+- Set `data.max_samples` to a safe cap for sweeps.
+
+Use full-data no-cap runs only with sufficient RAM/disk and expected runtime.
 
 ## Output layout
 
